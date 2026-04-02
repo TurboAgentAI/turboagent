@@ -11,8 +11,8 @@ Commercial extensions for teams and organizations requiring:
   - Dedicated support SLAs
 
 License: Commercial (separate from MIT core).
-Contact: enterprise@turboagent.dev
-More info: https://turboagent.dev/enterprise
+Contact: enterprise@turboagent.to
+More info: https://turboagent.to/enterprise
 """
 
 from turboagent.enterprise.license import is_enterprise_license_valid, get_license_info

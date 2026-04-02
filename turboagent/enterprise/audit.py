@@ -6,7 +6,7 @@ capabilities for compliance reviews. Integrates with TurboAgent and
 TurboSwarm via the enterprise feature flags.
 
 Requires: TURBOAGENT_LICENSE_KEY with 'audit_logging' feature.
-License: Commercial. See https://turboagent.dev/enterprise
+License: Commercial. See https://turboagent.to/enterprise
 """
 
 import json
@@ -59,7 +59,7 @@ class AuditLogger:
         if not has_feature("audit_logging"):
             raise RuntimeError(
                 "AuditLogger requires an enterprise license with "
-                "'audit_logging' feature. See https://turboagent.dev/enterprise"
+                "'audit_logging' feature. See https://turboagent.to/enterprise"
             )
 
         self.enabled = enabled

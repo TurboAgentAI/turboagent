@@ -15,7 +15,7 @@ TurboAgent is a pip-installable Python package that brings Google Research's [Tu
 ## Quick Start
 
 ```bash
-pip install turboagent[llama]
+pip install turboagent-ai[llama]
 ```
 
 ```python
@@ -35,19 +35,19 @@ print(response)  # KV usage <4 GB total
 
 ```bash
 # Core + llama.cpp backend (recommended for consumer GPUs)
-pip install turboagent[llama]
+pip install turboagent-ai[llama]
 
 # With vLLM for server-style throughput
-pip install turboagent[vllm]
+pip install turboagent-ai[vllm]
 
 # With HuggingFace Transformers for research
-pip install turboagent[torch]
+pip install turboagent-ai[torch]
 
 # With native TurboQuant C++/CUDA kernels (recommended for best performance)
-pip install turboagent[native]
+pip install turboagent-ai[native]
 
 # Development
-pip install turboagent[dev]
+pip install turboagent-ai[dev]
 ```
 
 ## CLI
@@ -118,7 +118,7 @@ turboagent/
 ## Development
 
 ```bash
-git clone https://github.com/turboagent/turboagent.git
+git clone https://github.com/TurboAgentAI/turboagent.git
 cd turboagent
 pip install -e ".[dev]"
 pytest tests/ -v -m "not integration"
@@ -145,7 +145,7 @@ from turboagent.enterprise.swarm import SecureMultiAgentSwarm
 from turboagent.enterprise.audit import AuditLogger
 ```
 
-Learn more: [turboagent.dev/enterprise](https://turboagent.dev/enterprise) | Contact: enterprise@turboagent.dev
+Learn more: [turboagent.to/enterprise](https://turboagent.to/enterprise) | Contact: enterprise@turboagent.to
 
 ## License
 

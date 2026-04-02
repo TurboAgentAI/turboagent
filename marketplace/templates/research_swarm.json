@@ -1,0 +1,26 @@
+{
+    "name": "research_swarm",
+    "description": "3-agent research pipeline: researcher + critic + writer collaborate on analytical tasks",
+    "type": "swarm",
+    "version": "1.0",
+    "kv_mode": "turbo3",
+    "context": 131072,
+    "max_rounds": 6,
+    "agents": [
+        {
+            "name": "researcher",
+            "role": "deep research and literature review",
+            "system_prompt": "You are a research scientist. Provide thorough, evidence-based analysis. Cite specific findings, methodologies, and data points. Be comprehensive but focused."
+        },
+        {
+            "name": "critic",
+            "role": "critical analysis and fact-checking",
+            "system_prompt": "You are a peer reviewer. Identify weaknesses, missing evidence, logical gaps, and potential biases in the research. Be constructive but rigorous. Suggest specific improvements."
+        },
+        {
+            "name": "writer",
+            "role": "clear scientific writing",
+            "system_prompt": "You are a science writer. Synthesize the research and critique into a clear, well-structured summary. Use precise language. When the summary is complete and addresses all critiques, end with [DONE]."
+        }
+    ]
+}

@@ -28,7 +28,7 @@ try:
 except ImportError:
     raise ImportError(
         "HuggingFace Transformers is not installed. "
-        "Install it via: pip install turboagent[torch]"
+        "Install it via: pip install turboagent-ai[torch]"
     )
 
 # DynamicCache is the standard KV cache class in transformers >= 4.38
@@ -184,7 +184,7 @@ class TorchEngine(BaseEngine):
         # --- Phase 5: EXTRACT and COMPRESS KV ---
         # The actual cache length is determined by what the model stored,
         # not our token count (last generated token may not be in cache yet).
-        actual_cache_seq_len = current_cache[0][0].shape[-2]  # (batch, heads, seq, dim)
+        actual_cache_seq_len = self._get_cache_seq_len(current_cache)
         self._extract_and_compress_kv(current_cache, kv_cache, actual_cache_seq_len)
         total_seq_len = actual_cache_seq_len
 
@@ -254,6 +254,48 @@ class TorchEngine(BaseEngine):
     # KV Cache Bridge: EXTRACT (past_key_values → TurboQuant)
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _get_kv_layer(past_key_values, layer_idx) -> tuple:
+        """
+        Extract (key, value) tensors for a layer from past_key_values.
+
+        Handles multiple transformers versions:
+          - Legacy: past_key_values[i] → (K, V)
+          - DynamicCache (old): cache[i] → (K, V)
+          - DynamicCache (new): cache.layers[i].keys / .values
+        """
+        # Try subscript first (works on legacy tuples and older DynamicCache)
+        try:
+            item = past_key_values[layer_idx]
+            if isinstance(item, tuple) and len(item) == 2:
+                return item
+        except (TypeError, IndexError):
+            pass
+
+        # Try .layers attribute (newer DynamicCache with DynamicLayer)
+        if hasattr(past_key_values, "layers"):
+            layer = past_key_values.layers[layer_idx]
+            return layer.keys, layer.values
+
+        # Try to_legacy_cache conversion
+        if hasattr(past_key_values, "to_legacy_cache"):
+            legacy = past_key_values.to_legacy_cache()
+            return legacy[layer_idx]
+
+        raise TypeError(
+            f"Cannot extract KV from {type(past_key_values).__name__}. "
+            f"Unsupported past_key_values format."
+        )
+
+    @staticmethod
+    def _get_cache_seq_len(past_key_values) -> int:
+        """Get the sequence length stored in the cache."""
+        try:
+            k, _ = TorchEngine._get_kv_layer(past_key_values, 0)
+            return k.shape[-2]
+        except Exception:
+            return 0
+
     def _extract_and_compress_kv(
         self, past_key_values, kv_cache: TurboQuantKVCache, seq_len: int
     ) -> None:
@@ -271,11 +313,8 @@ class TorchEngine(BaseEngine):
         """
         n_layers = min(self._n_layers, kv_cache.num_layers)
 
-        # Both DynamicCache and legacy tuple format support indexing:
-        #   cache[layer_idx] → (key_tensor, value_tensor)
-        # Each tensor has shape (batch, n_kv_heads, seq_len, head_dim)
         for layer_idx in range(n_layers):
-            k, v = past_key_values[layer_idx]
+            k, v = self._get_kv_layer(past_key_values, layer_idx)
 
             # Flatten to (seq_len, n_kv_heads * head_dim) for TurboQuant
             k_flat = self._flatten_from_model(k)

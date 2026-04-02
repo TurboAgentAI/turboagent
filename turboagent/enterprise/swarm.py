@@ -5,7 +5,7 @@ Requires a valid TurboAgent Enterprise license.
 Features: role-based access control, audit logging, compliance exports,
 multi-node KV sharing, governance policies.
 
-License: Commercial. See https://turboagent.dev/enterprise
+License: Commercial. See https://turboagent.to/enterprise
 """
 
 import logging
@@ -43,7 +43,7 @@ class SecureMultiAgentSwarm(TurboSwarm):
         if not has_feature("secure_swarm"):
             raise RuntimeError(
                 "SecureMultiAgentSwarm requires an enterprise license with "
-                "'secure_swarm' feature. See https://turboagent.dev/enterprise"
+                "'secure_swarm' feature. See https://turboagent.to/enterprise"
             )
 
         super().__init__(model_id, agents, **kwargs)

@@ -26,7 +26,7 @@ try:
     from llama_cpp import Llama
     import llama_cpp
 except ImportError:
-    raise ImportError("llama-cpp-python is missing. Run: pip install turboagent[llama]")
+    raise ImportError("llama-cpp-python is missing. Run: pip install turboagent-ai[llama]")
 
 from turboagent.quant.turboquant import TurboQuantKVCache
 from turboagent.backends.base import BaseEngine

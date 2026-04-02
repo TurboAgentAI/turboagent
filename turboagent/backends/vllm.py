@@ -18,7 +18,7 @@ try:
     from vllm import LLM, SamplingParams
 except ImportError:
     raise ImportError(
-        "vLLM is not installed. Install it via: pip install turboagent[vllm]"
+        "vLLM is not installed. Install it via: pip install turboagent-ai[vllm]"
     )
 
 

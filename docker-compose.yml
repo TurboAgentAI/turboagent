@@ -1,0 +1,45 @@
+# =============================================================================
+# TurboAgent Cloud — docker-compose configuration
+#
+# Quick start:
+#   docker compose up
+#
+# With custom model:
+#   TURBOAGENT_MODEL=meta-llama/Llama-3.1-70B-Instruct docker compose up
+#
+# With auth:
+#   TURBOAGENT_API_KEYS=sk-mykey1,sk-mykey2 docker compose up
+# =============================================================================
+
+services:
+  turboagent:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - TURBOAGENT_MODEL=${TURBOAGENT_MODEL:-Qwen/Qwen2.5-32B-Instruct}
+      - TURBOAGENT_BACKEND=${TURBOAGENT_BACKEND:-}
+      - TURBOAGENT_KV_MODE=${TURBOAGENT_KV_MODE:-turbo3}
+      - TURBOAGENT_CONTEXT=${TURBOAGENT_CONTEXT:-}
+      - TURBOAGENT_API_KEYS=${TURBOAGENT_API_KEYS:-}
+      - TURBOAGENT_RATE_LIMIT=${TURBOAGENT_RATE_LIMIT:-60}
+      - HF_TOKEN=${HF_TOKEN:-}
+    volumes:
+      # Persist HuggingFace model cache across restarts
+      - hf_cache:/data/hf_cache
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  hf_cache:

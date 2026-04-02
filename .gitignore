@@ -19,6 +19,9 @@ env/
 *.swo
 *~
 
+# Build artifacts
+docs/_build/
+
 # Testing / Coverage
 .pytest_cache/
 htmlcov/
@@ -43,3 +46,14 @@ credentials.json
 
 # Claude Code
 .claude/
+
+# Private / local-only files
+PyPI_account.txt
+GitHub.txt
+Website_and_Email.txt
+resume_claude.txt
+status.md
+TurboAgent.docx
+TurboAgent.md
+2504.19874v1.pdf
+website/

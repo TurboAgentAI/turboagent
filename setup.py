@@ -3,7 +3,7 @@
 from setuptools import setup, find_packages
 
 setup(
-    name="turboagent",
+    name="turboagent-ai",
     version="0.1.0",
     packages=find_packages(include=["turboagent*"]),
     install_requires=[
@@ -17,6 +17,7 @@ setup(
         "vllm": ["vllm>=0.7.0"],
         "torch": ["transformers>=4.40.0", "huggingface_hub>=0.23.0"],
         "native": ["turboquant-kv>=0.2.0"],
+        "server": ["fastapi>=0.115.0", "uvicorn[standard]>=0.32.0"],
         "enterprise": ["turboagent-enterprise>=0.1.0"],
         "dev": [
             "pytest>=8.0",
@@ -34,7 +35,7 @@ setup(
     description="TurboQuant-powered agentic AI framework for long-context LLMs on consumer hardware",
     long_description=open("README.md", encoding="utf-8").read(),
     long_description_content_type="text/markdown",
-    url="https://github.com/turboagent/turboagent",
+    url="https://github.com/TurboAgentAI/turboagent",
     license="MIT",
     classifiers=[
         "Development Status :: 4 - Beta",

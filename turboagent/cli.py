@@ -92,7 +92,7 @@ CMD ["python", "main.py"]
 
     print(f"Project scaffolded at: {project_dir}")
     print(f"  cd {project_name}")
-    print(f"  pip install turboagent[llama]")
+    print(f"  pip install turboagent-ai[llama]")
     print(f"  python main.py")
 
 
@@ -179,10 +179,44 @@ def cmd_info(args: argparse.Namespace) -> None:
             print(f"  Key: {info['key_prefix']}")
             print(f"  Features: {', '.join(info['features'])}")
         else:
-            print("  Enterprise features: https://turboagent.dev/enterprise")
+            print("  Enterprise features: https://turboagent.to/enterprise")
     except ImportError:
         print("  Tier: community (open-source core)")
-        print("  Enterprise features: https://turboagent.dev/enterprise")
+        print("  Enterprise features: https://turboagent.to/enterprise")
+
+
+def cmd_serve(args: argparse.Namespace) -> None:
+    """Start the TurboAgent API server."""
+    try:
+        import uvicorn
+    except ImportError:
+        print("Error: uvicorn is required. Install via: pip install turboagent-ai[server]")
+        sys.exit(1)
+
+    from turboagent.server import create_app
+
+    api_keys = [k.strip() for k in args.api_keys.split(",") if k.strip()] if args.api_keys else []
+
+    print(f"Starting TurboAgent API Server v{__version__}")
+    print(f"  Model:    {args.model}")
+    print(f"  Backend:  {args.backend or 'auto'}")
+    print(f"  KV mode:  {args.kv_mode}")
+    print(f"  Context:  {args.context or 'auto'}")
+    print(f"  Auth:     {'enabled' if api_keys else 'disabled (open access)'}")
+    print(f"  Rate:     {args.rate_limit} req/min")
+    print(f"  Endpoint: http://{args.host}:{args.port}/v1/chat/completions")
+    print()
+
+    app = create_app(
+        model_id=args.model,
+        backend=args.backend or None,
+        kv_mode=args.kv_mode,
+        context=args.context,
+        api_keys=api_keys,
+        rate_limit=args.rate_limit,
+    )
+
+    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
 
 def main() -> None:
@@ -213,6 +247,18 @@ def main() -> None:
     # info
     p_info = subparsers.add_parser("info", help="Print hardware info and optimal config")
     p_info.set_defaults(func=cmd_info)
+
+    # serve
+    p_serve = subparsers.add_parser("serve", help="Start the API server")
+    p_serve.add_argument("--model", required=True, help="Model ID (HF hub or local path)")
+    p_serve.add_argument("--backend", default="", help="Backend: llama.cpp, torch, vllm")
+    p_serve.add_argument("--kv-mode", default="turbo3", help="turbo3 or turbo4")
+    p_serve.add_argument("--context", type=int, default=None, help="Max context length")
+    p_serve.add_argument("--host", default="0.0.0.0", help="Bind host (default: 0.0.0.0)")
+    p_serve.add_argument("--port", type=int, default=8000, help="Bind port (default: 8000)")
+    p_serve.add_argument("--api-keys", default="", help="Comma-separated API keys (empty = no auth)")
+    p_serve.add_argument("--rate-limit", type=int, default=60, help="Requests/min per key")
+    p_serve.set_defaults(func=cmd_serve)
 
     args = parser.parse_args()
 

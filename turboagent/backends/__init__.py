@@ -31,7 +31,7 @@ def create_engine(model_id: str, backend: str = "llama.cpp", **kwargs) -> Any:
         except ImportError as e:
             raise ImportError(
                 "llama-cpp-python is not installed. "
-                "Install it via: pip install turboagent[llama]"
+                "Install it via: pip install turboagent-ai[llama]"
             ) from e
 
     elif backend == "vllm":
@@ -41,7 +41,7 @@ def create_engine(model_id: str, backend: str = "llama.cpp", **kwargs) -> Any:
         except ImportError as e:
             raise ImportError(
                 "vLLM is not installed. "
-                "Install it via: pip install turboagent[vllm]"
+                "Install it via: pip install turboagent-ai[vllm]"
             ) from e
 
     elif backend == "torch":
@@ -51,7 +51,7 @@ def create_engine(model_id: str, backend: str = "llama.cpp", **kwargs) -> Any:
         except ImportError as e:
             raise ImportError(
                 "PyTorch is missing. "
-                "Install it via: pip install turboagent[torch]"
+                "Install it via: pip install turboagent-ai[torch]"
             ) from e
 
     elif backend == "mlx":

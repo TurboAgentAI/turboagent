@@ -17,7 +17,7 @@ class TurboAgent:
 
     This is part of the open-source TurboAgent core (MIT license).
     Commercial extensions (SSO, audit logging, advanced swarm governance) are
-    available via TurboAgent Enterprise: https://turboagent.dev/enterprise
+    available via TurboAgent Enterprise: https://turboagent.to/enterprise
     """
 
     def __init__(

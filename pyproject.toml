@@ -3,12 +3,12 @@ requires = ["setuptools>=70.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "turboagent"
+name = "turboagent-ai"
 version = "0.1.0"
 description = "TurboQuant-powered agentic AI framework for long-context LLMs on consumer hardware"
 readme = "README.md"
 license = {text = "MIT"}
-authors = [{name = "TurboAgent Contributors", email = "contrib@turboagent.dev"}]
+authors = [{name = "TurboAgent Contributors", email = "contrib@turboagent.to"}]
 keywords = ["llm", "turboquant", "kv-cache", "agentic-ai", "local-inference", "rag"]
 requires-python = ">=3.10"
 classifiers = [
@@ -33,6 +33,7 @@ llama = ["llama-cpp-python>=0.3.0"]
 vllm = ["vllm>=0.7.0"]
 torch = ["transformers>=4.40.0", "huggingface_hub>=0.23.0"]
 native = ["turboquant-kv>=0.2.0"]
+server = ["fastapi>=0.115.0", "uvicorn[standard]>=0.32.0"]
 enterprise = ["turboagent-enterprise>=0.1.0"]
 dev = [
     "pytest>=8.0",
@@ -45,11 +46,11 @@ dev = [
 docs = ["sphinx>=7.0", "furo>=2024.0"]
 
 [project.urls]
-Homepage = "https://github.com/turboagent/turboagent"
-Documentation = "https://turboagent.dev"
-Repository = "https://github.com/turboagent/turboagent"
-Issues = "https://github.com/turboagent/turboagent/issues"
-Enterprise = "https://turboagent.dev/enterprise"
+Homepage = "https://github.com/TurboAgentAI/turboagent"
+Documentation = "https://turboagent.to"
+Repository = "https://github.com/TurboAgentAI/turboagent"
+Issues = "https://github.com/TurboAgentAI/turboagent/issues"
+Enterprise = "https://turboagent.to/enterprise"
 
 [project.scripts]
 turboagent = "turboagent.cli:main"

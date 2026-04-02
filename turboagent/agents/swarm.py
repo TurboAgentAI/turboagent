@@ -55,7 +55,7 @@ class TurboSwarm:
     This is part of the open-source TurboAgent core (MIT license).
     For advanced governance, RBAC, audit logging, and compliance exports,
     see SecureMultiAgentSwarm in TurboAgent Enterprise:
-    https://turboagent.dev/enterprise
+    https://turboagent.to/enterprise
 
     Args:
         model_id: HuggingFace hub ID or local path.
