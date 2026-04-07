@@ -97,14 +97,102 @@ class TorchEngine(BaseEngine):
 
         # Inter-turn state
         self._prev_input_ids: Optional[torch.Tensor] = None
-        self._n_layers = self.model.config.num_hidden_layers
-        self._head_dim = getattr(
-            self.model.config, "head_dim",
-            self.model.config.hidden_size // self.model.config.num_attention_heads,
+
+        # Detect actual KV dimensions by running a 1-token forward pass.
+        # Inspects all layers to handle heterogeneous shapes (Gemma 3/4
+        # interleaved sliding-window attention has varying KV dims per layer).
+        (
+            self._n_layers,
+            self._n_kv_heads,
+            self._head_dim,
+            self._layer_shapes,
+        ) = self._detect_kv_shape()
+        logger.info(
+            f"Detected: {self._n_layers} layers, most common shape: "
+            f"{self._n_kv_heads} kv_heads x {self._head_dim} head_dim"
         )
-        self._n_kv_heads = getattr(
-            self.model.config, "num_key_value_heads",
-            self.model.config.num_attention_heads,
+
+    def _detect_kv_shape(self) -> Tuple[int, int, int, Dict[int, Tuple[int, int]]]:
+        """
+        Run a 1-token forward pass and inspect past_key_values for ALL layers
+        to determine the (n_layers, n_kv_heads, head_dim_per_head).
+
+        Inspects every layer because some models (Gemma 3/4 with interleaved
+        sliding-window attention) have heterogeneous KV shapes across layers.
+        Returns the maximum dimensions found and logs all unique shapes.
+        """
+        dummy = torch.tensor([[self.tokenizer.eos_token_id or 0]], device=self.device)
+        with torch.inference_mode():
+            out = self.model(input_ids=dummy, use_cache=True)
+        pkv = out.past_key_values
+
+        # Helper to extract (K, V) from any past_key_values format
+        def _get_layer_kv(idx):
+            if hasattr(pkv, "layers"):
+                layer = pkv.layers[idx]
+                return layer.keys, layer.values
+            if hasattr(pkv, "key_cache"):
+                return pkv.key_cache[idx], pkv.value_cache[idx]
+            return pkv[idx][0], pkv[idx][1]
+
+        # Count layers
+        if hasattr(pkv, "layers"):
+            n_layers = len(pkv.layers)
+        elif hasattr(pkv, "key_cache"):
+            n_layers = len(pkv.key_cache)
+        else:
+            n_layers = len(pkv)
+
+        # Inspect every layer and record per-layer shape
+        layer_shapes: Dict[int, Tuple[int, int]] = {}
+        unique_shapes: Dict[Tuple[int, int], int] = {}
+        for i in range(n_layers):
+            k, _ = _get_layer_kv(i)
+            if k.dim() != 4:
+                raise RuntimeError(
+                    f"Unexpected K tensor shape at layer {i}: {k.shape}. "
+                    f"Expected 4D (batch, heads, seq, dim)."
+                )
+            shape_key = (k.shape[1], k.shape[3])
+            layer_shapes[i] = shape_key
+            unique_shapes[shape_key] = unique_shapes.get(shape_key, 0) + 1
+
+        # Log what we found
+        logger.info(f"Inspected {n_layers} layers. Unique KV shapes:")
+        for (kvh, hd), count in sorted(unique_shapes.items(), key=lambda x: -x[1]):
+            logger.info(f"  ({kvh} kv_heads, {hd} head_dim) -> {count} layers")
+
+        if len(unique_shapes) > 1:
+            logger.warning(
+                f"Heterogeneous KV shapes detected ({len(unique_shapes)} variants). "
+                f"Per-layer quantizers will be created lazily."
+            )
+
+        # Return the most common shape (used as default sizing hint)
+        most_common = max(unique_shapes.items(), key=lambda x: x[1])
+        n_kv_heads, head_dim = most_common[0]
+
+        return n_layers, n_kv_heads, head_dim, layer_shapes
+
+    @staticmethod
+    def _resolve_text_config(config):
+        """
+        Find the transformer config object.
+
+        Modern multimodal models (Gemma 3n, Gemma 4, Llama 3.2 Vision) wrap
+        the text-decoder config inside .text_config. Older models expose the
+        params directly on the top-level config. Try the nested location
+        first, then fall back to the top-level config.
+        """
+        for attr in ("text_config", "decoder_config", "language_config"):
+            sub = getattr(config, attr, None)
+            if sub is not None and hasattr(sub, "num_hidden_layers"):
+                return sub
+        if hasattr(config, "num_hidden_layers"):
+            return config
+        raise AttributeError(
+            f"Could not find num_hidden_layers in {type(config).__name__}. "
+            f"Tried: text_config, decoder_config, language_config, top-level."
         )
 
     # ------------------------------------------------------------------
@@ -220,35 +308,31 @@ class TorchEngine(BaseEngine):
         """
         Dequantize compressed KV state and build past_key_values.
 
-        Returns a DynamicCache (or list of tuples) suitable for passing
-        to model.forward(past_key_values=...).
+        Uses per-layer shapes (`self._layer_shapes`) to handle models with
+        heterogeneous KV dimensions across layers.
         """
         n_layers = min(self._n_layers, kv_cache.num_layers)
+
+        def _build_layer(layer_idx: int):
+            k_deq, v_deq = kv_cache.get(layer_idx, seq_len)
+            nkh, hd = self._layer_shapes.get(
+                layer_idx, (self._n_kv_heads, self._head_dim)
+            )
+            k = self._reshape_for_model(k_deq, seq_len, nkh, hd)
+            v = self._reshape_for_model(v_deq, seq_len, nkh, hd)
+            return k, v
 
         if DynamicCache is not None:
             cache = DynamicCache()
             for layer_idx in range(n_layers):
-                k_deq, v_deq = kv_cache.get(layer_idx, seq_len)
-
-                # Reshape from (seq_len, head_dim) to (batch=1, n_kv_heads, seq_len, head_dim)
-                k = self._reshape_for_model(k_deq, seq_len)
-                v = self._reshape_for_model(v_deq, seq_len)
-
+                k, v = _build_layer(layer_idx)
                 cache.update(k, v, layer_idx)
-
-            logger.debug(f"Injected {seq_len} tokens from TurboQuant cache (DynamicCache)")
+            logger.debug(f"Injected {seq_len} tokens (DynamicCache)")
             return cache
         else:
-            # Fallback: list of (K, V) tuples
-            past = []
-            for layer_idx in range(n_layers):
-                k_deq, v_deq = kv_cache.get(layer_idx, seq_len)
-                k = self._reshape_for_model(k_deq, seq_len)
-                v = self._reshape_for_model(v_deq, seq_len)
-                past.append((k, v))
-
-            logger.debug(f"Injected {seq_len} tokens from TurboQuant cache (tuple list)")
-            return tuple(past)
+            past = tuple(_build_layer(i) for i in range(n_layers))
+            logger.debug(f"Injected {seq_len} tokens (tuple list)")
+            return past
 
     # ------------------------------------------------------------------
     # KV Cache Bridge: EXTRACT (past_key_values → TurboQuant)
@@ -332,13 +416,22 @@ class TorchEngine(BaseEngine):
     # Tensor reshaping: (seq, dim) ↔ (batch, heads, seq, head_dim)
     # ------------------------------------------------------------------
 
-    def _reshape_for_model(self, flat: torch.Tensor, seq_len: int) -> torch.Tensor:
+    def _reshape_for_model(
+        self, flat: torch.Tensor, seq_len: int,
+        n_kv_heads: Optional[int] = None, head_dim: Optional[int] = None,
+    ) -> torch.Tensor:
         """
         Reshape (seq_len, n_kv_heads * head_dim) → (1, n_kv_heads, seq_len, head_dim)
         for injection into HuggingFace attention layers.
+
+        If n_kv_heads / head_dim are not provided, falls back to detected values.
+        Per-layer overrides are needed for models with heterogeneous KV shapes
+        (Gemma 3/4 with interleaved attention).
         """
         flat = flat.to(device=self.device, dtype=self.dtype)
-        return flat.view(seq_len, self._n_kv_heads, self._head_dim).permute(1, 0, 2).unsqueeze(0)
+        nkh = n_kv_heads if n_kv_heads is not None else self._n_kv_heads
+        hd = head_dim if head_dim is not None else self._head_dim
+        return flat.view(seq_len, nkh, hd).permute(1, 0, 2).unsqueeze(0)
 
     def _flatten_from_model(self, tensor: torch.Tensor) -> torch.Tensor:
         """

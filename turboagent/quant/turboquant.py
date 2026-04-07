@@ -164,6 +164,12 @@ class _NativePackedQuantizer:
     then packs the output (int64 indices + float32 signs) into compact
     bit-packed byte tensors for memory-efficient storage.
 
+    LAZY + PER-SHAPE: Underlying TurboQuantProd instances are created on
+    first use, keyed by the actual input head dimension. This handles
+    models with heterogeneous KV shapes across layers (e.g., Gemma 3/4
+    interleaved sliding-window attention where local and global layers
+    have different KV head counts).
+
     Storage per element:
       - turbo3: 2-bit idx + 1-bit sign = 3 bits → ~3.5x compression
       - turbo4: 3-bit idx + 1-bit sign = 4 bits → ~2.7x compression
@@ -173,24 +179,33 @@ class _NativePackedQuantizer:
     def __init__(self, bits: int, head_dim: int, device: str):
         self.bits = bits
         self.mse_bits = bits - 1  # Algorithm 2 uses b-1 bits for MSE stage
-        self.head_dim = head_dim
+        self.default_head_dim = head_dim  # hint only; actual dim detected at runtime
         self.device = device
-        self._tq = _NativeTurboQuantProd(
-            bits=bits, head_dim=head_dim, device=device
-        )
+        # One TurboQuantProd instance per unique head_dim encountered
+        self._tqs: dict[int, _NativeTurboQuantProd] = {}
+
+    def _get_tq(self, head_dim: int) -> "_NativeTurboQuantProd":
+        if head_dim not in self._tqs:
+            logger.debug(
+                f"Creating TurboQuantProd instance for head_dim={head_dim} "
+                f"(seen {len(self._tqs) + 1} unique shape(s) so far)"
+            )
+            self._tqs[head_dim] = _NativeTurboQuantProd(
+                bits=self.bits, head_dim=head_dim, device=self.device
+            )
+        return self._tqs[head_dim]
 
     def quantize(self, x: torch.Tensor) -> dict:
         """Quantize and bit-pack a (seq_len, head_dim) tensor."""
-        from turboagent.quant.bitpack import pack_kv_dict
+        # Detect actual head_dim from the tensor itself
+        actual_head_dim = x.shape[-1]
+        tq = self._get_tq(actual_head_dim)
 
         # turboquant expects (batch, heads, seq, dim) — wrap as single-head
-        seq_len = x.shape[0]
         x_4d = x.unsqueeze(0).unsqueeze(0).to(self.device)  # (1, 1, seq, dim)
 
-        # Use the same tensor for both K and V slots; we only need one
-        kv_dict = self._tq.quantize_kv(x_4d, x_4d, return_compressed=True)
+        kv_dict = tq.quantize_kv(x_4d, x_4d, return_compressed=True)
 
-        # Extract just the K portion (we packed the same data into both slots)
         single = {
             "idx": kv_dict["k_idx"],
             "norm": kv_dict["k_norm"],
@@ -199,7 +214,6 @@ class _NativePackedQuantizer:
             "shape": kv_dict["k_idx"].shape,
         }
 
-        # Bit-pack for storage
         packed = {
             "idx_packed": _pack_indices_fast(single["idx"].cpu(), self.mse_bits),
             "sign_packed": _pack_signs_fast(single["sign"].cpu()),
@@ -207,6 +221,7 @@ class _NativePackedQuantizer:
             "gamma": single["gamma"].cpu().half(),
             "shape": single["shape"],
             "mse_bits": self.mse_bits,
+            "head_dim": actual_head_dim,  # remember for dequantization
         }
         return packed
 
@@ -214,21 +229,22 @@ class _NativePackedQuantizer:
         """Unpack and dequantize back to (seq_len, head_dim) tensor."""
         shape = packed["shape"]
         mse_bits = packed["mse_bits"]
+        head_dim = packed.get("head_dim", shape[-1])
 
-        # Unpack
+        # Get the quantizer matching this layer's dimension
+        tq = self._get_tq(head_dim)
+
         idx = _unpack_indices_fast(packed["idx_packed"], shape, mse_bits).to(torch.int64)
         sign = _unpack_signs_fast(packed["sign_packed"], shape)
         norm = packed["norm"].float()
         gamma = packed["gamma"].float()
 
-        # Dequantize via turboquant's math
-        x_tilde = self._tq.dequantize(
+        x_tilde = tq.dequantize(
             idx.to(self.device),
             norm.to(self.device),
             sign.to(self.device),
             gamma.to(self.device),
         )
-        # Remove batch/head dims → (seq_len, head_dim)
         return x_tilde.squeeze(0).squeeze(0).half()
 
 

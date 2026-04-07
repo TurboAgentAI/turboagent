@@ -4,13 +4,14 @@
 # Target: RTX PRO 6000 (96GB VRAM)
 #
 # Usage:
-#   bash vastai/setup.sh               # Qwen2.5-32B (default, ungated, fits 96GB BF16)
+#   bash vastai/setup.sh               # Gemma-4-31B-it (default, agentic-optimized)
+#   bash vastai/setup.sh qwen32        # Qwen2.5-32B
 #   bash vastai/setup.sh qwen72        # Qwen2.5-72B (needs >144GB for BF16)
 #   bash vastai/setup.sh llama         # Llama-3.1-70B (gated, needs HF approval)
 # =============================================================================
 set -e
 
-MODEL_CHOICE="${1:-qwen32}"
+MODEL_CHOICE="${1:-gemma4}"
 export TURBO_TEST_MODEL="$MODEL_CHOICE"
 
 echo "============================================"
@@ -76,8 +77,7 @@ p = hf_hub_download('bartowski/Qwen2.5-72B-Instruct-GGUF', 'Qwen2.5-72B-Instruct
 print(f'GGUF: {p}')
 "
 
-else
-    # Default: Qwen2.5-32B — fits in 96GB BF16, ungated
+elif [ "$MODEL_CHOICE" = "qwen32" ]; then
     python3 -c "
 from transformers import AutoTokenizer
 print('Downloading Qwen2.5-32B tokenizer...')
@@ -88,6 +88,21 @@ print('Done.')
 from huggingface_hub import hf_hub_download
 print('Downloading Qwen2.5-32B GGUF Q4_K_M from bartowski...')
 p = hf_hub_download('bartowski/Qwen2.5-32B-Instruct-GGUF', 'Qwen2.5-32B-Instruct-Q4_K_M.gguf')
+print(f'GGUF: {p}')
+"
+
+else
+    # Default: Gemma-4-31B-it — agentic-optimized, 256k context, fits 96GB BF16
+    python3 -c "
+from transformers import AutoTokenizer
+print('Downloading Gemma-4-31B-it tokenizer...')
+AutoTokenizer.from_pretrained('google/gemma-4-31B-it', trust_remote_code=True)
+print('Done.')
+"
+    python3 -c "
+from huggingface_hub import hf_hub_download
+print('Downloading Gemma-4-31B-it GGUF Q4_K_M from bartowski...')
+p = hf_hub_download('bartowski/google_gemma-4-31B-it-GGUF', 'google_gemma-4-31B-it-Q4_K_M.gguf')
 print(f'GGUF: {p}')
 "
 fi

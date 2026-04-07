@@ -3,14 +3,16 @@ TurboAgent Large Model Integration Test Suite for Vast.ai (RTX PRO 6000, 96GB VR
 
 Validates the complete TurboQuant pipeline on production-scale models.
 
-Default model: Qwen2.5-32B-Instruct (~64GB in BF16, fits in 96GB VRAM)
-  - 64 layers, GQA attention, head_dim=128
-  - Large enough for meaningful TurboQuant validation
-  - Well above the <7B quality degradation threshold
+Default model: Gemma-4-31B-it (Google DeepMind's flagship agentic model, ~62GB BF16)
+  - 256k native context window
+  - Function calling + structured JSON output (designed for agents)
+  - Currently #3 on Arena AI Text leaderboard
+  - Apache 2.0 license
 
 Set TURBO_TEST_MODEL env var to override:
-  - TURBO_TEST_MODEL=qwen32  → Qwen/Qwen2.5-32B-Instruct (default, ungated)
-  - TURBO_TEST_MODEL=qwen72  → Qwen/Qwen2.5-72B-Instruct (needs 4-bit or larger GPU)
+  - TURBO_TEST_MODEL=gemma4  → google/gemma-4-31B-it (default, agentic-optimized)
+  - TURBO_TEST_MODEL=qwen32  → Qwen/Qwen2.5-32B-Instruct
+  - TURBO_TEST_MODEL=qwen72  → Qwen/Qwen2.5-72B-Instruct
   - TURBO_TEST_MODEL=llama   → meta-llama/Llama-3.1-70B-Instruct (gated)
 
 Run: python -m pytest vastai/test_70b_integration.py -v -s --timeout=600
@@ -35,9 +37,15 @@ logging.basicConfig(
 # Model configuration
 # ---------------------------------------------------------------------------
 
-_MODEL_CHOICE = os.environ.get("TURBO_TEST_MODEL", "qwen32").lower()
+_MODEL_CHOICE = os.environ.get("TURBO_TEST_MODEL", "gemma4").lower()
 
 _MODEL_CONFIGS = {
+    "gemma4": {
+        "hf_id": "google/gemma-4-31B-it",
+        "gguf_repo": "bartowski/google_gemma-4-31B-it-GGUF",
+        "gguf_file": "google_gemma-4-31B-it-Q4_K_M.gguf",
+        "label": "Gemma-4-31B-it",
+    },
     "qwen32": {
         "hf_id": "Qwen/Qwen2.5-32B-Instruct",
         "gguf_repo": "bartowski/Qwen2.5-32B-Instruct-GGUF",
@@ -195,6 +203,86 @@ class TestTorchLargeModel:
 
         assert "PHOENIX-42" in resp2 or "PHOENIX" in resp2, \
             f"Failed to recall after TurboQuant KV injection: {resp2[:300]}"
+
+    def test_gemma4_agentic_json_output(self, engine_and_cache):
+        """
+        Gemma 4 specific test: verify structured JSON output works after
+        TurboQuant KV compression. Gemma 4 was designed for agentic workflows
+        with native JSON / function calling support.
+        """
+        if "gemma" not in HF_MODEL.lower():
+            pytest.skip("Gemma 4 specific test")
+
+        engine, cache = engine_and_cache
+        cache.clear()
+        engine._prev_input_ids = None
+
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are an agent that responds in valid JSON only. "
+                    "No prose, no markdown, just JSON."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "Extract the entities from this text and return JSON with "
+                    "keys 'people', 'places', 'organizations':\n\n"
+                    "Sundar Pichai, CEO of Google, announced the new Gemma 4 "
+                    "model in Mountain View at Google I/O. The DeepMind team "
+                    "in London contributed key research."
+                ),
+            },
+        ]
+
+        response, metrics = engine.generate_chat(messages, cache)
+        print(f"\n[Gemma4 JSON] Response: {response[:500]}")
+
+        # Verify structured output — agentic capability preserved through compression
+        import json
+        import re
+        json_match = re.search(r"\{.*\}", response, re.DOTALL)
+        assert json_match, f"No JSON found in response: {response[:300]}"
+
+        try:
+            parsed = json.loads(json_match.group())
+            print(f"[Gemma4 JSON] Parsed: {parsed}")
+            assert isinstance(parsed, dict)
+            assert any(k in parsed for k in ["people", "places", "organizations"])
+        except json.JSONDecodeError as e:
+            pytest.fail(f"Invalid JSON output: {e}\nResponse: {response[:500]}")
+
+    def test_gemma4_long_context_recall(self, engine_and_cache):
+        """
+        Gemma 4 has 256k native context. Test that TurboQuant compression
+        preserves long-context recall on Gemma 4's signature feature.
+        """
+        if "gemma" not in HF_MODEL.lower():
+            pytest.skip("Gemma 4 specific test")
+
+        engine, cache = engine_and_cache
+        cache.clear()
+        engine._prev_input_ids = None
+
+        # Build a moderately long context with a fact buried in the middle
+        filler = "The weather forecast predicts mild temperatures throughout the region. " * 20
+        needle = "ATTENTION: The activation phrase for the system is BLUE-DOLPHIN-7."
+        prompt = f"{filler}\n\n{needle}\n\n{filler}\n\nWhat is the activation phrase mentioned above?"
+
+        messages = [
+            {"role": "system", "content": "You are a precise assistant."},
+            {"role": "user", "content": prompt},
+        ]
+
+        response, metrics = engine.generate_chat(messages, cache)
+        print(f"\n[Gemma4 Long Ctx] Tokens cached: {metrics['total_tokens_cached']}")
+        print(f"[Gemma4 Long Ctx] Response: {response[:300]}")
+        print(f"[Gemma4 Long Ctx] Compression: {cache.fp16_baseline_gb()/cache.memory_usage_gb():.2f}x")
+
+        assert "BLUE-DOLPHIN-7" in response or "BLUE-DOLPHIN" in response, \
+            f"Failed long-context recall: {response[:300]}"
 
     def test_compression_ratio(self, engine_and_cache):
         engine, cache = engine_and_cache
