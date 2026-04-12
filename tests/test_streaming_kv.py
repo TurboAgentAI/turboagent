@@ -614,3 +614,159 @@ class TestStreamingCorrectness:
         assert sdc._turbo._seq_len == 37  # 32 prefill + 5 decode, compressed once
         assert sdc._prefill_seq_len == 0   # buffers cleared
         assert sdc._decode_seq_len == 0
+
+
+# ---------------------------------------------------------------------------
+# Stage 3: pinned memory + async prefetch infrastructure
+# ---------------------------------------------------------------------------
+
+
+class TestStage3Infrastructure:
+    """
+    Tests for Stage 3 additions: pinned-memory buffers and async prefetch.
+
+    Most of these run on CPU (DEVICE = "cpu") where pinned memory and CUDA
+    streams are unavailable.  The tests verify:
+      • _use_pinned and _copy_stream are correctly initialised for the platform.
+      • Prefetch dicts (_pf_turbo, _pf_prefill) exist and behave correctly on CPU.
+      • _kick_prefetch is a no-op during prefill and on CPU.
+      • Dicts are cleared by finalize_decode() and at the start of each layer-0 call.
+      • Correctness is unchanged (existing 35 tests still hold with Stage 3 code).
+    """
+
+    def test_use_pinned_false_on_cpu(self):
+        """On a CPU-only machine, pinned memory must not be requested."""
+        sdc = _make_sdc()
+        # CUDA is not available in the test environment (DEVICE="cpu")
+        assert sdc._use_pinned == torch.cuda.is_available()
+
+    def test_copy_stream_none_on_cpu(self):
+        """copy_stream must be None when CUDA is unavailable."""
+        sdc = _make_sdc()
+        if not torch.cuda.is_available():
+            assert sdc._copy_stream is None
+
+    def test_prefetch_dicts_exist(self):
+        """_pf_turbo and _pf_prefill dicts must be created on init."""
+        sdc = _make_sdc()
+        assert hasattr(sdc, "_pf_turbo")
+        assert hasattr(sdc, "_pf_prefill")
+        assert isinstance(sdc._pf_turbo, dict)
+        assert isinstance(sdc._pf_prefill, dict)
+
+    def test_prefetch_dicts_empty_on_init(self):
+        sdc = _make_sdc()
+        assert len(sdc._pf_turbo) == 0
+        assert len(sdc._pf_prefill) == 0
+
+    def test_kick_prefetch_noop_during_prefill(self):
+        """
+        _kick_prefetch must be a no-op when not in decode mode.
+        Prefetch dicts must stay empty throughout prefill.
+        """
+        sdc = _make_sdc(seq_len=16)
+        _full_prefill(sdc, n_new=8)
+        _full_prefill(sdc, n_new=8)
+        assert len(sdc._pf_turbo) == 0, "_pf_turbo should be empty during prefill"
+        assert len(sdc._pf_prefill) == 0, "_pf_prefill should be empty during prefill"
+
+    def test_prefetch_dicts_empty_after_full_decode_step_on_cpu(self):
+        """
+        On CPU (no copy stream), no entries should accumulate in prefetch dicts.
+        """
+        sdc = _make_sdc(seq_len=16)
+        _full_prefill(sdc, n_new=8)
+        sdc.start_decode()
+
+        for _ in range(3):
+            _decode_step(sdc)
+            assert len(sdc._pf_turbo) == 0
+            assert len(sdc._pf_prefill) == 0
+
+    def test_start_decode_clears_prefetch_dicts(self):
+        """start_decode() must clear any residual prefetch state."""
+        sdc = _make_sdc(seq_len=16)
+        # Manually inject stale entries to verify they're cleared
+        sdc._pf_turbo[3] = (None, None)
+        sdc._pf_prefill[2] = (None, None)
+
+        _full_prefill(sdc, n_new=8)
+        sdc.start_decode()
+
+        assert len(sdc._pf_turbo) == 0
+        assert len(sdc._pf_prefill) == 0
+
+    def test_finalize_decode_clears_prefetch_dicts(self):
+        """finalize_decode() must clear prefetch dicts."""
+        sdc = _make_sdc(seq_len=16)
+        _full_prefill(sdc, n_new=8)
+        sdc.start_decode()
+        for _ in range(3):
+            _decode_step(sdc)
+
+        # Manually inject stale entries
+        sdc._pf_turbo[0] = (None, None)
+        sdc._pf_prefill[1] = (None, None)
+
+        sdc.finalize_decode()
+        assert len(sdc._pf_turbo) == 0
+        assert len(sdc._pf_prefill) == 0
+
+    def test_layer0_update_clears_stale_prefetch(self):
+        """
+        update(layer_idx=0) must clear stale prefetch dicts from the previous
+        forward pass.  This is a defensive guard for exception recovery.
+
+        After update(0), the dict may contain a fresh entry for layer 1
+        (kicked off by _kick_prefetch on CUDA machines), but the stale
+        entries injected for arbitrary layers (5, 3) must be gone.
+        """
+        sdc = _make_sdc(seq_len=16)
+        sdc.start_decode()
+
+        # Inject stale entries (simulating a prior forward pass that was interrupted)
+        sdc._pf_turbo[5] = (None, None)
+        sdc._pf_prefill[3] = (None, None)
+
+        # A layer-0 update must evict the stale entries
+        new_k = torch.randn(1, N_KV_HEADS, 1, HEAD_DIM, dtype=DTYPE)
+        new_v = torch.randn(1, N_KV_HEADS, 1, HEAD_DIM, dtype=DTYPE)
+        sdc.update(new_k, new_v, layer_idx=0)
+
+        # Stale keys (5, 3) must be gone
+        assert 5 not in sdc._pf_turbo, "stale pf_turbo[5] not cleared by update(0)"
+        assert 3 not in sdc._pf_prefill, "stale pf_prefill[3] not cleared by update(0)"
+        # All remaining keys must be valid layer indices (i.e., layer 1 on CUDA)
+        for k in sdc._pf_turbo:
+            assert 0 < k < N_LAYERS, f"unexpected key {k} in _pf_turbo"
+        for k in sdc._pf_prefill:
+            assert 0 < k < N_LAYERS, f"unexpected key {k} in _pf_prefill"
+
+    def test_repr_includes_pinned(self):
+        sdc = _make_sdc()
+        r = repr(sdc)
+        assert "pinned=" in r
+
+    def test_correctness_unchanged_with_stage3_code(self):
+        """
+        Stage 3 must not change the output of update().
+        Run a full turn and verify turbo._seq_len matches expected.
+        """
+        sdc = StreamingDynamicCache(
+            turbo_cache=TurboQuantKVCache(
+                bit_mode="turbo3", device=DEVICE,
+                head_dim=N_KV_HEADS * HEAD_DIM, num_layers=N_LAYERS,
+                max_context=8192,
+            ),
+            layer_shapes=_make_layer_shapes(),
+            layer_devices=_make_layer_devices(),
+            dtype=DTYPE,
+            default_n_kv_heads=N_KV_HEADS,
+            default_head_dim=HEAD_DIM,
+        )
+        _full_prefill(sdc, n_new=32)
+        sdc.start_decode()
+        for _ in range(8):
+            _decode_step(sdc)
+        sdc.finalize_decode()
+        assert sdc._turbo._seq_len == 40  # 32 prefill + 8 decode
