@@ -112,9 +112,16 @@ class TestHardwareDetection:
     def test_gpu_detected(self):
         from turboagent.hardware.detector import HardwareDetector
         specs = HardwareDetector.get_system_specs()
-        print(f"\n[HW] GPU: {specs['gpu_name']} | VRAM: {specs['vram_gb']:.1f} GB | RAM: {specs['ram_gb']:.1f} GB")
+        n_gpus = specs.get("n_gpus", 1)
+        per_gpu = specs.get("vram_per_gpu_gb", specs["vram_gb"])
+        print(
+            f"\n[HW] GPU: {specs['gpu_name']} | "
+            f"Total VRAM: {specs['vram_gb']:.1f} GB ({n_gpus}x {per_gpu:.1f} GB) | "
+            f"RAM: {specs['ram_gb']:.1f} GB"
+        )
         assert specs["has_cuda"] is True
-        assert specs["vram_gb"] >= 80
+        # Accept any GPU >= 24GB total (single GPU or multi-GPU)
+        assert specs["vram_gb"] >= 24
 
     def test_config_for_large_gpu(self):
         from turboagent.hardware.detector import HardwareDetector

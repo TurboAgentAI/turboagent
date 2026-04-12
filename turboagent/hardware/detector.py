@@ -25,6 +25,8 @@ class HardwareDetector:
             "has_mps": False,
             "has_rocm": False,
             "vram_gb": 0.0,
+            "vram_per_gpu_gb": 0.0,
+            "n_gpus": 0,
             "gpu_name": "None"
         }
 
@@ -35,10 +37,23 @@ class HardwareDetector:
             if hasattr(torch.version, 'hip') and torch.version.hip is not None:
                 specs["has_cuda"] = False
                 specs["has_rocm"] = True
-            
-            device = torch.cuda.current_device()
-            specs["vram_gb"] = torch.cuda.get_device_properties(device).total_memory / (1024 ** 3)
-            specs["gpu_name"] = torch.cuda.get_device_name(device)
+
+            n_gpus = torch.cuda.device_count()
+            specs["n_gpus"] = n_gpus
+
+            # Sum VRAM across all visible GPUs (multi-GPU instances)
+            total_vram = 0.0
+            per_gpu_vram = 0.0
+            for i in range(n_gpus):
+                gpu_vram = torch.cuda.get_device_properties(i).total_memory / (1024 ** 3)
+                total_vram += gpu_vram
+                per_gpu_vram = max(per_gpu_vram, gpu_vram)
+
+            specs["vram_gb"] = total_vram
+            specs["vram_per_gpu_gb"] = per_gpu_vram
+            specs["gpu_name"] = torch.cuda.get_device_name(0)
+            if n_gpus > 1:
+                specs["gpu_name"] = f"{n_gpus}x {specs['gpu_name']}"
 
         # Check for Apple Silicon (Metal Performance Shaders)
         elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():

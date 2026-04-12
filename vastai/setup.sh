@@ -92,30 +92,49 @@ print(f'GGUF: {p}')
 "
 
 else
-    # Default: Gemma-4-31B-it — agentic-optimized, 256k context, fits 96GB BF16
+    # Default: Gemma-4-31B-it BF16 (~62 GB) — agentic-optimized, 256k context
+    # Pre-download the FULL BF16 weights, not just the tokenizer.
+    # The torch backend uses BF16 — this is what the compression results
+    # are measured against.
     python3 -c "
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, AutoModelForCausalLM
+import torch
 print('Downloading Gemma-4-31B-it tokenizer...')
 AutoTokenizer.from_pretrained('google/gemma-4-31B-it', trust_remote_code=True)
-print('Done.')
+print('Pre-downloading Gemma-4-31B-it BF16 weights (~62 GB)...')
+print('(This populates the HF cache so the test does not download mid-run.)')
+AutoModelForCausalLM.from_pretrained(
+    'google/gemma-4-31B-it',
+    dtype=torch.bfloat16,
+    trust_remote_code=True,
+    low_cpu_mem_usage=True,
+)
+print('BF16 weights cached.')
 "
-    python3 -c "
-from huggingface_hub import hf_hub_download
-print('Downloading Gemma-4-31B-it GGUF Q4_K_M from bartowski...')
-p = hf_hub_download('bartowski/google_gemma-4-31B-it-GGUF', 'google_gemma-4-31B-it-Q4_K_M.gguf')
-print(f'GGUF: {p}')
-"
+    # Note: GGUF Q4_K_M download removed. llama.cpp tests fail in Vast.ai
+    # containers due to missing libcudart.so.12. Torch backend uses BF16.
 fi
 
 # 5. Unit tests
 echo ""
-echo "[5/6] Running unit tests"
+echo "[5/7] Running unit tests"
 python3 -m pytest tests/ -v -m "not integration" --timeout=60
 
-# 6. Integration tests
+# 6. Integration tests (basic functional, torch backend only)
+# llama.cpp tests are deselected because Vast.ai containers lack libcudart.so.12
+# Timeout is generous (1800s = 30 min) to account for model loading from
+# cache + GPU sharding across multiple devices.
 echo ""
-echo "[6/6] Running integration tests (TURBO_TEST_MODEL=$MODEL_CHOICE)"
-python3 -m pytest vastai/test_70b_integration.py -v -s --timeout=600
+echo "[6/7] Running integration tests (TURBO_TEST_MODEL=$MODEL_CHOICE)"
+python3 -m pytest vastai/test_70b_integration.py -v -s --timeout=1800 \
+    --deselect vastai/test_70b_integration.py::TestLlamaCppLargeModel
+
+# 7. Long-context NIAH benchmark (the real test)
+echo ""
+echo "[7/7] Running long-context NIAH benchmark (4k -> 96k tokens)"
+echo "      This will take 30-60 minutes."
+echo "      Override lengths via: export NIAH_LENGTHS=4000,16000,32000,65000,96000"
+python3 -m pytest vastai/test_long_context_niah.py -v -s --timeout=3600
 
 echo ""
 echo "============================================"

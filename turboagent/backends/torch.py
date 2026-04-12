@@ -14,11 +14,13 @@ KV cache lifecycle:
 """
 
 import logging
-from typing import Any, Dict, List, Optional, Tuple
+import os
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import torch
 
 from turboagent.quant.turboquant import TurboQuantKVCache
+from turboagent.quant.streaming_kv import StreamingDynamicCache
 from turboagent.backends.base import BaseEngine
 
 logger = logging.getLogger("turboagent.backends.torch")
@@ -53,11 +55,25 @@ class TorchEngine(BaseEngine):
 
     Args:
         model_id: HuggingFace model ID or local path.
+        kv_storage: KV storage strategy.
+            ``"gpu"``            — classic path: decompress all layers to GPU
+                                   upfront, inject as DynamicCache (v1.0).
+            ``"cpu_streaming"``  — Option C Stage 1: keep compressed KV on CPU,
+                                   stream one layer at a time to GPU during the
+                                   forward pass (StreamingDynamicCache).
+            ``"auto"``           — choose ``"cpu_streaming"`` when estimated KV
+                                   size exceeds available VRAM, else ``"gpu"``.
         **kwargs: Hardware config from HardwareDetector.
     """
 
-    def __init__(self, model_id: str, **kwargs):
+    def __init__(
+        self,
+        model_id: str,
+        kv_storage: Literal["auto", "gpu", "cpu_streaming"] = "auto",
+        **kwargs,
+    ):
         self.model_id = model_id
+        self.kv_storage = kv_storage
         self.n_ctx = kwargs.get("context", 131072)
         self.max_new_tokens = kwargs.get("max_tokens", 4096)
         self.temperature = kwargs.get("temperature", 0.7)
@@ -84,16 +100,106 @@ class TorchEngine(BaseEngine):
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
+        # Reduce CUDA memory fragmentation for long-context workloads.
+        # max_split_size_mb prevents the allocator from creating large
+        # unfreeable splits that lead to fragmentation OOMs.
+        os.environ.setdefault(
+            "PYTORCH_CUDA_ALLOC_CONF",
+            "expandable_segments:True,max_split_size_mb:256",
+        )
+
         device_map = "auto" if n_gpu_layers == -1 else None
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_id,
+
+        # Build max_memory dict to control GPU/CPU weight sharding.
+        #
+        # Single GPU:
+        #   device_map="auto" without a cap greedily fills GPU 0, leaving no
+        #   room for KV cache or activations.  We always cap single-GPU usage
+        #   to leave a headroom buffer.
+        #   - cpu_streaming: KV lives on CPU (~few MB on GPU), reserve 0.5 GiB
+        #   - gpu / auto:    KV lives on GPU, reserve 2 GiB for KV + activations
+        #
+        # Multi-GPU:
+        #   Balance sharding across all GPUs at 55% each, as before.
+        max_memory = None
+        if device_map == "auto" and torch.cuda.is_available():
+            n_gpus = torch.cuda.device_count()
+            if n_gpus == 1:
+                total_gib = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+                if kv_storage == "cpu_streaming":
+                    # Streaming: KV never accumulates on GPU; only tiny compute
+                    # buffers needed. Reserve 0.5 GiB for activations/fragmentation.
+                    reserve_gib = 0.5
+                else:
+                    # GPU path: need headroom for KV cache + activations.
+                    reserve_gib = 2.0
+                cap_gib = max(int(total_gib - reserve_gib), int(total_gib * 0.75))
+                max_memory = {0: f"{cap_gib}GiB", "cpu": "80GiB"}
+                logger.info(
+                    f"Single-GPU max_memory: {cap_gib} GiB "
+                    f"(kv_storage={kv_storage!r}, reserve={reserve_gib} GiB)"
+                )
+            elif n_gpus > 1:
+                max_memory = {}
+                for i in range(n_gpus):
+                    total_gib = torch.cuda.get_device_properties(i).total_memory / (1024**3)
+                    cap_gib = int(total_gib * 0.55)  # leave 45% for activations
+                    max_memory[i] = f"{cap_gib}GiB"
+                max_memory["cpu"] = "200GiB"
+                logger.info(f"Multi-GPU balanced sharding via max_memory: {max_memory}")
+
+        # Use SDPA (PyTorch's Flash Attention 2) by default — critical for
+        # long-context inference. The default "eager" attention materializes
+        # the full N^2 attention matrix which OOMs beyond ~8k tokens.
+        attn_impl = kwargs.get("attn_implementation", "sdpa")
+
+        load_kwargs = dict(
             dtype=self.dtype,
             device_map=device_map,
             trust_remote_code=True,
+            attn_implementation=attn_impl,
         )
+        if max_memory is not None:
+            load_kwargs["max_memory"] = max_memory
+
+        try:
+            self.model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
+        except (ValueError, ImportError) as e:
+            logger.warning(
+                f"Failed to load with {attn_impl} attention ({e}). "
+                f"Falling back to eager (will OOM at long contexts)."
+            )
+            load_kwargs.pop("attn_implementation", None)
+            self.model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
+
+        # Verify what attention implementation was actually applied
+        actual_attn = "unknown"
+        try:
+            cfg = self.model.config
+            actual_attn = getattr(cfg, "_attn_implementation", "unknown")
+        except Exception:
+            pass
+        # Also check the text_config (for nested Gemma 4)
+        try:
+            text_cfg = getattr(self.model.config, "text_config", None)
+            if text_cfg is not None:
+                text_attn = getattr(text_cfg, "_attn_implementation", None)
+                if text_attn:
+                    actual_attn = f"{actual_attn} / text:{text_attn}"
+        except Exception:
+            pass
+
+        print(f"[TorchEngine] ATTENTION IMPL IN USE: {actual_attn}")
+        logger.info(f"Model loaded. Attention implementation: {actual_attn}")
+
         if device_map is None:
             self.model.to(self.device)
         self.model.eval()
+
+        # Chunked prefill — feed long prompts in slices to avoid OOM.
+        # Smaller chunks = lower peak activation memory but more overhead.
+        # 1024 is conservative for tight VRAM situations (Gemma 4 on 32GB cards).
+        self.prefill_chunk_size = int(kwargs.get("prefill_chunk_size", 1024))
 
         # Inter-turn state
         self._prev_input_ids: Optional[torch.Tensor] = None
@@ -106,13 +212,20 @@ class TorchEngine(BaseEngine):
             self._n_kv_heads,
             self._head_dim,
             self._layer_shapes,
+            self._layer_devices,
         ) = self._detect_kv_shape()
         logger.info(
             f"Detected: {self._n_layers} layers, most common shape: "
             f"{self._n_kv_heads} kv_heads x {self._head_dim} head_dim"
         )
+        unique_devices = set(str(d) for d in self._layer_devices.values())
+        if len(unique_devices) > 1:
+            logger.info(
+                f"Tensor parallelism detected: layers spread across "
+                f"{len(unique_devices)} devices: {sorted(unique_devices)}"
+            )
 
-    def _detect_kv_shape(self) -> Tuple[int, int, int, Dict[int, Tuple[int, int]]]:
+    def _detect_kv_shape(self) -> Tuple[int, int, int, Dict[int, Tuple[int, int]], Dict[int, torch.device]]:
         """
         Run a 1-token forward pass and inspect past_key_values for ALL layers
         to determine the (n_layers, n_kv_heads, head_dim_per_head).
@@ -143,8 +256,9 @@ class TorchEngine(BaseEngine):
         else:
             n_layers = len(pkv)
 
-        # Inspect every layer and record per-layer shape
+        # Inspect every layer and record per-layer shape AND device
         layer_shapes: Dict[int, Tuple[int, int]] = {}
+        layer_devices: Dict[int, torch.device] = {}
         unique_shapes: Dict[Tuple[int, int], int] = {}
         for i in range(n_layers):
             k, _ = _get_layer_kv(i)
@@ -155,6 +269,7 @@ class TorchEngine(BaseEngine):
                 )
             shape_key = (k.shape[1], k.shape[3])
             layer_shapes[i] = shape_key
+            layer_devices[i] = k.device  # capture the actual device for this layer
             unique_shapes[shape_key] = unique_shapes.get(shape_key, 0) + 1
 
         # Log what we found
@@ -172,7 +287,7 @@ class TorchEngine(BaseEngine):
         most_common = max(unique_shapes.items(), key=lambda x: x[1])
         n_kv_heads, head_dim = most_common[0]
 
-        return n_layers, n_kv_heads, head_dim, layer_shapes
+        return n_layers, n_kv_heads, head_dim, layer_shapes, layer_devices
 
     @staticmethod
     def _resolve_text_config(config):
@@ -193,6 +308,63 @@ class TorchEngine(BaseEngine):
         raise AttributeError(
             f"Could not find num_hidden_layers in {type(config).__name__}. "
             f"Tried: text_config, decoder_config, language_config, top-level."
+        )
+
+    # ------------------------------------------------------------------
+    # Option C: Streaming KV injection
+    # ------------------------------------------------------------------
+
+    def _resolve_kv_storage(self, kv_cache: TurboQuantKVCache) -> str:
+        """
+        Resolve "auto" → "gpu" or "cpu_streaming" based on available VRAM.
+
+        Estimates the decompressed KV size for this cache state.  If it
+        exceeds 60% of free VRAM we switch to streaming automatically.
+        """
+        if self.kv_storage != "auto":
+            return self.kv_storage
+
+        if not torch.cuda.is_available():
+            return "gpu"  # CPU-only: no streaming benefit
+
+        # Estimate FP16 KV size for ALL layers at current seq_len
+        seq_len = max(kv_cache._seq_len, 1)
+        fp16_bytes = 0
+        for layer_idx in range(self._n_layers):
+            nkh, hd = self._layer_shapes.get(
+                layer_idx, (self._n_kv_heads, self._head_dim)
+            )
+            # K + V, batch=1, dtype=2 bytes
+            fp16_bytes += 2 * 1 * nkh * seq_len * hd * 2
+
+        free_bytes = torch.cuda.mem_get_info()[0]  # (free, total)
+        threshold = 0.60 * free_bytes
+
+        if fp16_bytes > threshold:
+            logger.info(
+                f"KV size {fp16_bytes/1e9:.2f} GB > {threshold/1e9:.2f} GB "
+                f"threshold ({free_bytes/1e9:.2f} GB free). "
+                f"Switching to cpu_streaming."
+            )
+            return "cpu_streaming"
+
+        return "gpu"
+
+    def _build_streaming_cache(self, kv_cache: TurboQuantKVCache) -> StreamingDynamicCache:
+        """
+        Wrap an existing TurboQuantKVCache in a StreamingDynamicCache.
+
+        The StreamingDynamicCache satisfies the full DynamicCache contract
+        (``update()``, ``get_seq_length()``, ``__len__()``) and can be passed
+        directly as ``past_key_values`` to any HuggingFace model.
+        """
+        return StreamingDynamicCache(
+            turbo_cache=kv_cache,
+            layer_shapes=self._layer_shapes,
+            layer_devices=self._layer_devices,
+            dtype=self.dtype,
+            default_n_kv_heads=self._n_kv_heads,
+            default_head_dim=self._head_dim,
         )
 
     # ------------------------------------------------------------------
@@ -223,30 +395,129 @@ class TorchEngine(BaseEngine):
         # --- Phase 1: Determine new tokens ---
         n_prev, new_input_ids = self._compute_token_diff(input_ids)
 
-        # Cap n_prev to what the TurboQuant cache actually holds
-        # (the cache may have fewer tokens than the token-diff suggests,
-        # because the model's cache length can differ from our token count)
-        if n_prev > 0 and kv_cache._seq_len > 0:
+        # Cap n_prev to what the TurboQuant cache actually holds.
+        # If the cache is empty (e.g., a fresh cache passed after a previous
+        # call used a different cache object), treat this as a fresh turn.
+        if kv_cache._seq_len == 0:
+            n_prev = 0
+            new_input_ids = input_ids
+        elif n_prev > 0:
             n_prev = min(n_prev, kv_cache._seq_len)
             new_input_ids = input_ids[:, n_prev:]
 
         # --- Phase 2: INJECT compressed KV as past_key_values ---
+        storage_mode = self._resolve_kv_storage(kv_cache)
         past_key_values = None
-        if n_prev > 0:
+        if storage_mode == "cpu_streaming":
+            # Option C — Stage 2: use StreamingDynamicCache even on the first
+            # turn (n_prev == 0).  This prevents GPU KV accumulation during
+            # long prefills: each layer's KV is compressed to CPU immediately
+            # rather than building up 28 × seq × kv_heads × head_dim FP16 on GPU.
+            #
+            # With n_prev == 0 the cache starts empty; update() just stores new
+            # tokens per-layer without decompressing any past.
+            past_key_values = self._build_streaming_cache(kv_cache)
+            if n_prev > 0:
+                logger.info(
+                    f"Option C active: streaming {n_prev} past tokens from CPU "
+                    f"({kv_cache.memory_usage_gb()*1000:.1f} MB compressed)"
+                )
+            else:
+                logger.info("Option C active: layer-wise prefill (first turn, no past)")
+        elif n_prev > 0:
             past_key_values = self._inject_kv_from_cache(kv_cache, n_prev)
 
         # --- Phase 3: PREFILL new tokens ---
-        with torch.inference_mode():
-            prefill_out = self.model(
-                input_ids=new_input_ids,
-                past_key_values=past_key_values,
-                use_cache=True,
+        # Chunked prefill: process the prompt in slices to bound peak memory.
+        # This is mandatory for long contexts; without it, transformers
+        # materializes (batch, seq, vocab) logits in FP32 which OOMs.
+        n_new = new_input_ids.shape[1]
+        chunk_size = self.prefill_chunk_size if self.prefill_chunk_size > 0 else n_new
+        n_chunks = (n_new + chunk_size - 1) // chunk_size
+
+        logger.info(
+            f"Prefill: {n_new} new tokens in {n_chunks} chunks of {chunk_size} "
+            f"(prefill_chunk_size={self.prefill_chunk_size})"
+        )
+        if n_chunks == 1 and n_new > 4096:
+            logger.warning(
+                f"WARNING: prefill is one big chunk of {n_new} tokens. "
+                f"chunked prefill is not active. self.prefill_chunk_size={self.prefill_chunk_size}"
             )
 
-        # The model returns updated past_key_values containing ALL tokens
-        # (injected + newly prefilled)
-        current_cache = prefill_out.past_key_values
-        next_token_logits = prefill_out.logits[:, -1, :]
+        current_cache = past_key_values
+        next_token_logits = None
+
+        for chunk_idx, chunk_start in enumerate(range(0, n_new, chunk_size)):
+            chunk_end = min(chunk_start + chunk_size, n_new)
+            chunk = new_input_ids[:, chunk_start:chunk_end]
+            is_last_chunk = chunk_end == n_new
+
+            logger.debug(
+                f"  prefill chunk {chunk_idx + 1}/{n_chunks}: "
+                f"tokens [{chunk_start}:{chunk_end}] (size {chunk.shape[1]})"
+            )
+
+            forward_kwargs = dict(
+                input_ids=chunk,
+                past_key_values=current_cache,
+                use_cache=True,
+                return_dict=True,
+            )
+
+            # Only the last chunk needs logits. Try to skip computing them
+            # entirely for non-final chunks via num_logits_to_keep.
+            if not is_last_chunk:
+                # Try modern arg, then legacy arg, fall back to no flag
+                for arg_name in ("num_logits_to_keep", "logits_to_keep"):
+                    try:
+                        with torch.inference_mode():
+                            chunk_out = self.model(
+                                **forward_kwargs, **{arg_name: 1}
+                            )
+                        break
+                    except TypeError:
+                        continue
+                else:
+                    with torch.inference_mode():
+                        chunk_out = self.model(**forward_kwargs)
+            else:
+                # Final chunk — try num_logits_to_keep=1 to limit logits memory
+                for arg_name in ("num_logits_to_keep", "logits_to_keep"):
+                    try:
+                        with torch.inference_mode():
+                            chunk_out = self.model(
+                                **forward_kwargs, **{arg_name: 1}
+                            )
+                        break
+                    except TypeError:
+                        continue
+                else:
+                    with torch.inference_mode():
+                        chunk_out = self.model(**forward_kwargs)
+
+            current_cache = chunk_out.past_key_values
+            if is_last_chunk:
+                next_token_logits = chunk_out.logits[:, -1, :].clone()
+
+            del chunk_out
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        if next_token_logits is None:
+            raise RuntimeError("Prefill produced no logits — empty input?")
+
+        # Switch streaming cache to decode mode: compress prefill buffer → turbo
+        # once, then freeze turbo for the duration of the decode loop.
+        # This must happen BEFORE the first decode step so that get_seq_length()
+        # returns the correct offset (turbo_seq = all prefill tokens).
+        if storage_mode == "cpu_streaming" and isinstance(current_cache, StreamingDynamicCache):
+            current_cache.start_decode()
+            logger.info(
+                f"StreamingDynamicCache: prefill → turbo "
+                f"({kv_cache._seq_len} tokens, {kv_cache.memory_usage_gb()*1000:.1f} MB), "
+                f"switching to decode mode"
+            )
 
         # --- Phase 4: GENERATE response tokens ---
         output_ids = []
@@ -270,10 +541,21 @@ class TorchEngine(BaseEngine):
             next_token_logits = step_out.logits[:, -1, :]
 
         # --- Phase 5: EXTRACT and COMPRESS KV ---
-        # The actual cache length is determined by what the model stored,
-        # not our token count (last generated token may not be in cache yet).
-        actual_cache_seq_len = self._get_cache_seq_len(current_cache)
-        self._extract_and_compress_kv(current_cache, kv_cache, actual_cache_seq_len)
+        # Streaming mode: finalize_decode() compresses the raw decode-token
+        # buffer into turbo ONCE (avoids re-compression noise), then
+        # kv_cache._seq_len is the authoritative token count.
+        # Classic mode: extract from DynamicCache GPU tensors and compress now.
+        if isinstance(current_cache, StreamingDynamicCache):
+            current_cache.finalize_decode()
+            actual_cache_seq_len = kv_cache._seq_len
+            logger.debug(
+                f"Streaming: decode tokens compressed into turbo "
+                f"({actual_cache_seq_len} tokens, "
+                f"{kv_cache.memory_usage_gb()*1000:.1f} MB)"
+            )
+        else:
+            actual_cache_seq_len = self._get_cache_seq_len(current_cache)
+            self._extract_and_compress_kv(current_cache, kv_cache, actual_cache_seq_len)
         total_seq_len = actual_cache_seq_len
 
         # Update state tracking
@@ -318,8 +600,11 @@ class TorchEngine(BaseEngine):
             nkh, hd = self._layer_shapes.get(
                 layer_idx, (self._n_kv_heads, self._head_dim)
             )
-            k = self._reshape_for_model(k_deq, seq_len, nkh, hd)
-            v = self._reshape_for_model(v_deq, seq_len, nkh, hd)
+            # Place KV on the same device as this layer's weights
+            # (critical for tensor-parallel models with device_map="auto")
+            dev = self._layer_devices.get(layer_idx, self.device)
+            k = self._reshape_for_model(k_deq, seq_len, nkh, hd, device=dev)
+            v = self._reshape_for_model(v_deq, seq_len, nkh, hd, device=dev)
             return k, v
 
         if DynamicCache is not None:
@@ -419,16 +704,19 @@ class TorchEngine(BaseEngine):
     def _reshape_for_model(
         self, flat: torch.Tensor, seq_len: int,
         n_kv_heads: Optional[int] = None, head_dim: Optional[int] = None,
+        device: Optional[torch.device] = None,
     ) -> torch.Tensor:
         """
         Reshape (seq_len, n_kv_heads * head_dim) → (1, n_kv_heads, seq_len, head_dim)
         for injection into HuggingFace attention layers.
 
         If n_kv_heads / head_dim are not provided, falls back to detected values.
-        Per-layer overrides are needed for models with heterogeneous KV shapes
-        (Gemma 3/4 with interleaved attention).
+        Per-layer overrides handle:
+          - heterogeneous KV shapes (Gemma 3/4 interleaved attention)
+          - tensor parallelism (each layer's KV must live on its layer's device)
         """
-        flat = flat.to(device=self.device, dtype=self.dtype)
+        target_device = device if device is not None else self.device
+        flat = flat.to(device=target_device, dtype=self.dtype)
         nkh = n_kv_heads if n_kv_heads is not None else self._n_kv_heads
         hd = head_dim if head_dim is not None else self._head_dim
         return flat.view(seq_len, nkh, hd).permute(1, 0, 2).unsqueeze(0)
