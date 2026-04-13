@@ -47,6 +47,9 @@ credentials.json
 # Claude Code
 .claude/
 
+# Internal testing infrastructure (Vast.ai scripts — not for public repo)
+vastai/
+
 # Private / local-only files
 PyPI_account.txt
 GitHub.txt
