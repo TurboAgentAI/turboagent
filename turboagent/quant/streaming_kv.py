@@ -84,6 +84,14 @@ import torch
 
 from turboagent.quant.turboquant import TurboQuantKVCache
 
+try:
+    from transformers import DynamicCache as _DynamicCacheBase
+except ImportError:
+    # Non-HuggingFace environment — define a no-op base so the class still works.
+    class _DynamicCacheBase:  # type: ignore[no-redef]
+        def __init__(self):
+            pass
+
 logger = logging.getLogger("turboagent.quant.streaming")
 
 # Default block size (tokens) for buffer growth.
@@ -91,7 +99,7 @@ logger = logging.getLogger("turboagent.quant.streaming")
 DEFAULT_BLOCK_SIZE: int = 16
 
 
-class StreamingDynamicCache:
+class StreamingDynamicCache(_DynamicCacheBase):
     """
     DynamicCache-compatible KV cache that keeps the CURRENT TURN in
     block-allocated pinned CPU buffers and compresses to TurboQuantKVCache
@@ -138,6 +146,15 @@ class StreamingDynamicCache:
         default_head_dim: int,
         block_size: int = DEFAULT_BLOCK_SIZE,
     ) -> None:
+        # Initialise the DynamicCache base so isinstance(self, DynamicCache) is
+        # True.  This is required in transformers ≥ 4.46 where Gemma 4 (and
+        # other models) check the cache type to decide whether to use SDPA or
+        # fall back to eager attention, and whether to create a HybridCache
+        # pre-allocation.  Without this, the model ignores our passed cache and
+        # allocates its own — which OOMs for long contexts (O(seq²) eager attn).
+        super().__init__()
+        # DynamicCache.__init__ sets key_cache/value_cache/seen_tokens; our
+        # update() override keeps those lists empty and handles all KV routing.
         self._turbo = turbo_cache
         self._layer_shapes = layer_shapes
         self._layer_devices = layer_devices
