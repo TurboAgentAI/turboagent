@@ -1,13 +1,17 @@
 #!/bin/bash
 # =============================================================================
 # TurboAgent Vast.ai Setup Script
-# Target: RTX PRO 6000 (96GB VRAM)
 #
 # Usage:
 #   bash vastai/setup.sh               # Gemma-4-31B-it (default, agentic-optimized)
+#   bash vastai/setup.sh optionc       # Option C 16k NIAH — Qwen2.5-7B (24 GB+ GPU)
 #   bash vastai/setup.sh qwen32        # Qwen2.5-32B
 #   bash vastai/setup.sh qwen72        # Qwen2.5-72B (needs >144GB for BF16)
 #   bash vastai/setup.sh llama         # Llama-3.1-70B (gated, needs HF approval)
+#
+# Option C validation (recommended: RTX 4090 24 GB, A10G, L4, or equivalent):
+#   bash vastai/setup.sh optionc
+#   NIAH_COMPARE_GPU=1 bash vastai/setup.sh optionc  # also run GPU path comparison
 # =============================================================================
 set -e
 
@@ -48,7 +52,27 @@ pip install llama-cpp-python --quiet 2>/dev/null || \
 echo ""
 echo "[4/6] Downloading models"
 
-if [ "$MODEL_CHOICE" = "llama" ]; then
+if [ "$MODEL_CHOICE" = "optionc" ]; then
+    # Option C 16k NIAH validation — Qwen2.5-7B-Instruct
+    # Hardware: any 24 GB+ GPU (RTX 4090, A10G, L4, RTX 6000 Ada, etc.)
+    # Qwen2.5-7B BF16 weights: ~14 GB. 16k KV streaming: <1 GB on GPU.
+    python3 -c "
+from transformers import AutoTokenizer, AutoModelForCausalLM
+import torch
+model_id = 'Qwen/Qwen2.5-7B-Instruct'
+print(f'Downloading {model_id} tokenizer...')
+AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+print(f'Pre-downloading {model_id} BF16 weights (~14 GB)...')
+AutoModelForCausalLM.from_pretrained(
+    model_id,
+    dtype=torch.bfloat16,
+    trust_remote_code=True,
+    low_cpu_mem_usage=True,
+)
+print('Weights cached.')
+"
+
+elif [ "$MODEL_CHOICE" = "llama" ]; then
     [ -z "$HF_TOKEN" ] && echo "WARNING: HF_TOKEN not set. Llama is gated."
     python3 -c "
 from transformers import AutoTokenizer
@@ -117,24 +141,35 @@ fi
 
 # 5. Unit tests
 echo ""
-echo "[5/7] Running unit tests"
+echo "[5/N] Running unit tests"
 python3 -m pytest tests/ -v -m "not integration" --timeout=60
 
-# 6. Integration tests (basic functional, torch backend only)
-# llama.cpp tests are deselected because Vast.ai containers lack libcudart.so.12
-# Timeout is generous (1800s = 30 min) to account for model loading from
-# cache + GPU sharding across multiple devices.
-echo ""
-echo "[6/7] Running integration tests (TURBO_TEST_MODEL=$MODEL_CHOICE)"
-python3 -m pytest vastai/test_70b_integration.py -v -s --timeout=1800 \
-    --deselect vastai/test_70b_integration.py::TestLlamaCppLargeModel
+if [ "$MODEL_CHOICE" = "optionc" ]; then
+    # Option C validation: skip integration tests, run the focused 16k NIAH script
+    echo ""
+    echo "[6/6] Running Option C 16k NIAH validation"
+    echo "      Model: Qwen/Qwen2.5-7B-Instruct | Target: 16,000 tokens | 5 depths"
+    echo "      NIAH_COMPARE_GPU=${NIAH_COMPARE_GPU:-0} (set to 1 to also run GPU path)"
+    echo "      Expected runtime: ~10-20 minutes on a 24 GB GPU"
+    python3 vastai/verify_option_c_16k.py
 
-# 7. Long-context NIAH benchmark (the real test)
-echo ""
-echo "[7/7] Running long-context NIAH benchmark (4k -> 96k tokens)"
-echo "      This will take 30-60 minutes."
-echo "      Override lengths via: export NIAH_LENGTHS=4000,16000,32000,65000,96000"
-python3 -m pytest vastai/test_long_context_niah.py -v -s --timeout=3600
+else
+    # 6. Integration tests (basic functional, torch backend only)
+    # llama.cpp tests are deselected because Vast.ai containers lack libcudart.so.12
+    # Timeout is generous (1800s = 30 min) to account for model loading from
+    # cache + GPU sharding across multiple devices.
+    echo ""
+    echo "[6/7] Running integration tests (TURBO_TEST_MODEL=$MODEL_CHOICE)"
+    python3 -m pytest vastai/test_70b_integration.py -v -s --timeout=1800 \
+        --deselect vastai/test_70b_integration.py::TestLlamaCppLargeModel
+
+    # 7. Long-context NIAH benchmark (the real test)
+    echo ""
+    echo "[7/7] Running long-context NIAH benchmark (4k -> 96k tokens)"
+    echo "      This will take 30-60 minutes."
+    echo "      Override lengths via: export NIAH_LENGTHS=4000,16000,32000,65000,96000"
+    python3 -m pytest vastai/test_long_context_niah.py -v -s --timeout=3600
+fi
 
 echo ""
 echo "============================================"
