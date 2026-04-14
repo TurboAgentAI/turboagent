@@ -196,9 +196,10 @@ class StreamingDynamicCache(_DynamicCacheBase):
         # multi-GPU deployments and let update() use its synchronous
         # .to(device=key_states.device, ...) path which is always correct.
         _n_unique_devs = len(set(layer_devices.values())) if layer_devices else 1
+        self._multi_gpu: bool = _n_unique_devs > 1
         self._copy_stream: Optional["torch.cuda.Stream"] = (
             torch.cuda.Stream()
-            if torch.cuda.is_available() and _n_unique_devs == 1
+            if torch.cuda.is_available() and not self._multi_gpu
             else None
         )
         # Prefetched GPU tensors for layer N+1; populated at end of update(N).
@@ -306,8 +307,12 @@ class StreamingDynamicCache(_DynamicCacheBase):
             else:
                 pk = self._prefill_buf_k[layer_idx][:, :, :self._prefill_write_ptr, :]
                 pv = self._prefill_buf_v[layer_idx][:, :, :self._prefill_write_ptr, :]
-                pk_gpu = pk.to(device=dev, dtype=self._dtype, non_blocking=self._use_pinned)
-                pv_gpu = pv.to(device=dev, dtype=self._dtype, non_blocking=self._use_pinned)
+                # For multi-GPU, non_blocking=True gives no latency benefit (no copy_stream
+                # to overlap with) but leaves the transfer unsequenced against any
+                # allocator operations between chunks — use blocking transfers instead.
+                _nb = self._use_pinned and not self._multi_gpu
+                pk_gpu = pk.to(device=dev, dtype=self._dtype, non_blocking=_nb)
+                pv_gpu = pv.to(device=dev, dtype=self._dtype, non_blocking=_nb)
             parts_k.append(pk_gpu)
             parts_v.append(pv_gpu)
 
@@ -316,8 +321,9 @@ class StreamingDynamicCache(_DynamicCacheBase):
         if self._is_decoding and self._decode_write_ptr > 0 and self._decode_buf_k[layer_idx] is not None:
             dk = self._decode_buf_k[layer_idx][:, :, :self._decode_write_ptr, :]
             dv = self._decode_buf_v[layer_idx][:, :, :self._decode_write_ptr, :]
-            parts_k.append(dk.to(device=dev, dtype=self._dtype, non_blocking=self._use_pinned))
-            parts_v.append(dv.to(device=dev, dtype=self._dtype, non_blocking=self._use_pinned))
+            _nb = self._use_pinned and not self._multi_gpu
+            parts_k.append(dk.to(device=dev, dtype=self._dtype, non_blocking=_nb))
+            parts_v.append(dv.to(device=dev, dtype=self._dtype, non_blocking=_nb))
 
         # ── (4) Current new tokens ────────────────────────────────────────────
         parts_k.append(key_states)
