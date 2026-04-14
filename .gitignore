@@ -47,8 +47,21 @@ credentials.json
 # Claude Code
 .claude/
 
+# GitHub Actions / CI — not for public repo
+.github/
+
 # Internal testing infrastructure (Vast.ai scripts — not for public repo)
 vastai/
+
+# Test suite — not for public repo
+tests/
+
+# Package metadata — not for public repo
+pyproject.toml
+setup.py
+
+# Website
+website/
 
 # Private / local-only files
 PyPI_account.txt
@@ -59,5 +72,9 @@ status.md
 TurboAgent.docx
 TurboAgent.md
 2504.19874v1.pdf
-website/
 Online_posts.txt
+
+# NIAH benchmark results
+niah_results_*.json
+option_c_*_results.json
+cpu_streaming_results.txt
