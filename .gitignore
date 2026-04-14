@@ -53,13 +53,6 @@ credentials.json
 # Internal testing infrastructure (Vast.ai scripts — not for public repo)
 vastai/
 
-# Test suite — not for public repo
-tests/
-
-# Package metadata — not for public repo
-pyproject.toml
-setup.py
-
 # Website
 website/
 
