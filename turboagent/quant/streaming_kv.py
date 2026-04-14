@@ -187,8 +187,19 @@ class StreamingDynamicCache(_DynamicCacheBase):
 
         # ── Stage 3: pinned memory + async prefetch ───────────────────────────
         self._use_pinned: bool = torch.cuda.is_available()
+
+        # Async prefetch requires a CUDA copy stream.  CUDA streams are
+        # device-specific: a stream created on cuda:0 cannot safely issue
+        # transfers to cuda:1, and vice-versa.  For multi-GPU models the
+        # stream device is unpredictable at init time (depends on which GPU
+        # was "current" last), so we disable async prefetch entirely for
+        # multi-GPU deployments and let update() use its synchronous
+        # .to(device=key_states.device, ...) path which is always correct.
+        _n_unique_devs = len(set(layer_devices.values())) if layer_devices else 1
         self._copy_stream: Optional["torch.cuda.Stream"] = (
-            torch.cuda.Stream() if torch.cuda.is_available() else None
+            torch.cuda.Stream()
+            if torch.cuda.is_available() and _n_unique_devs == 1
+            else None
         )
         # Prefetched GPU tensors for layer N+1; populated at end of update(N).
         self._pf_turbo: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
@@ -356,11 +367,20 @@ class StreamingDynamicCache(_DynamicCacheBase):
 
     def get_mask_sizes(
         self,
-        cache_position: "torch.Tensor",
+        cache_position,  # torch.Tensor (4.46+) OR int (some 5.x call sites)
         layer_idx: Optional[int] = None,
     ) -> tuple:
-        """(kv_length, kv_offset) for causal mask construction."""
-        new_seq_len = cache_position.shape[-1]
+        """(kv_length, kv_offset) for causal mask construction.
+
+        Handles two calling conventions:
+          • transformers 4.46–5.x new API: cache_position is a 1D torch.Tensor
+            of absolute positions; seq_len = cache_position.shape[-1].
+          • transformers 5.x some Gemma paths: first arg is seq_len as a plain int.
+        """
+        if isinstance(cache_position, int):
+            new_seq_len = cache_position
+        else:
+            new_seq_len = int(cache_position.shape[-1])
         total_past = (
             self._turbo._seq_len + self._prefill_seq_len + self._decode_seq_len
         )
@@ -574,8 +594,23 @@ class StreamingDynamicCache(_DynamicCacheBase):
 
         Only active during decode (prefill buffer is stable; during prefill it
         is still growing and unsafe to prefetch ahead).
+
+        Multi-GPU note: the copy_stream is tied to the device it was created on
+        (cuda:0 by default). Issuing async transfers to a *different* GPU from
+        within that stream is unreliable and results in the transferred tensor
+        landing on the wrong device, causing torch.cat device-mismatch errors.
+        At GPU boundaries (next_layer lives on a different device) we therefore
+        skip the async path — update() falls back to the synchronous .to() which
+        always uses key_states.device and is always correct.
         """
         if not self._is_decoding:
+            return
+
+        # Determine the actual target device for next_layer.
+        next_dev = self._layer_devices.get(next_layer, dev)
+
+        # Skip async prefetch at GPU boundaries; synchronous path handles it.
+        if next_dev != dev:
             return
 
         nkh, hd = self._layer_shapes.get(
@@ -594,8 +629,8 @@ class StreamingDynamicCache(_DynamicCacheBase):
             if not v_flat.is_pinned():
                 v_flat = v_flat.pin_memory()
             with torch.cuda.stream(self._copy_stream):
-                k_gpu = k_flat.to(device=dev, dtype=self._dtype, non_blocking=True)
-                v_gpu = v_flat.to(device=dev, dtype=self._dtype, non_blocking=True)
+                k_gpu = k_flat.to(device=next_dev, dtype=self._dtype, non_blocking=True)
+                v_gpu = v_flat.to(device=next_dev, dtype=self._dtype, non_blocking=True)
             k_t = k_gpu.view(turbo_seq, nkh, hd).permute(1, 0, 2).unsqueeze(0)
             v_t = v_gpu.view(turbo_seq, nkh, hd).permute(1, 0, 2).unsqueeze(0)
             self._pf_turbo[next_layer] = (k_t, v_t)
@@ -611,8 +646,8 @@ class StreamingDynamicCache(_DynamicCacheBase):
             pk = self._prefill_buf_k[next_layer][:, :, :self._prefill_write_ptr, :]
             pv = self._prefill_buf_v[next_layer][:, :, :self._prefill_write_ptr, :]
             with torch.cuda.stream(self._copy_stream):
-                pk_gpu = pk.to(device=dev, dtype=self._dtype, non_blocking=True)
-                pv_gpu = pv.to(device=dev, dtype=self._dtype, non_blocking=True)
+                pk_gpu = pk.to(device=next_dev, dtype=self._dtype, non_blocking=True)
+                pv_gpu = pv.to(device=next_dev, dtype=self._dtype, non_blocking=True)
             self._pf_prefill[next_layer] = (pk_gpu, pv_gpu)
 
     # ------------------------------------------------------------------

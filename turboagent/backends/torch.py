@@ -26,7 +26,7 @@ from turboagent.backends.base import BaseEngine
 logger = logging.getLogger("turboagent.backends.torch")
 
 try:
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 except ImportError:
     raise ImportError(
         "HuggingFace Transformers is not installed. "
@@ -153,12 +153,37 @@ class TorchEngine(BaseEngine):
         # the full N^2 attention matrix which OOMs beyond ~8k tokens.
         attn_impl = kwargs.get("attn_implementation", "sdpa")
 
+        # In transformers 5.x, attn_implementation="sdpa" passed to from_pretrained()
+        # does not propagate to text_config._attn_implementation for composite models
+        # like Gemma 4. The attention class is selected at __init__ time by reading
+        # text_config._attn_implementation, so we must patch it BEFORE model construction.
+        pre_config = None
+        try:
+            pre_config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+            pre_config._attn_implementation = attn_impl
+            text_cfg_pre = getattr(pre_config, "text_config", None)
+            if text_cfg_pre is not None:
+                text_cfg_pre._attn_implementation = attn_impl
+                logger.info(
+                    f"Pre-patched text_config._attn_implementation={attn_impl!r} "
+                    f"(transformers 5.x composite model fix)"
+                )
+            else:
+                logger.info(f"Pre-patched config._attn_implementation={attn_impl!r}")
+        except Exception as e:
+            logger.warning(
+                f"Could not pre-load config for attn_implementation patching "
+                f"(will rely on kwarg only): {e}"
+            )
+
         load_kwargs = dict(
             dtype=self.dtype,
             device_map=device_map,
             trust_remote_code=True,
             attn_implementation=attn_impl,
         )
+        if pre_config is not None:
+            load_kwargs["config"] = pre_config
         if max_memory is not None:
             load_kwargs["max_memory"] = max_memory
 
@@ -170,22 +195,21 @@ class TorchEngine(BaseEngine):
                 f"Falling back to eager (will OOM at long contexts)."
             )
             load_kwargs.pop("attn_implementation", None)
+            load_kwargs.pop("config", None)
             self.model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
 
-        # Verify what attention implementation was actually applied
+        # Verify what attention implementation was actually applied.
+        # Check text_config first (used by composite models like Gemma 4);
+        # fall back to top-level config.
         actual_attn = "unknown"
-        try:
-            cfg = self.model.config
-            actual_attn = getattr(cfg, "_attn_implementation", "unknown")
-        except Exception:
-            pass
-        # Also check the text_config (for nested Gemma 4)
         try:
             text_cfg = getattr(self.model.config, "text_config", None)
             if text_cfg is not None:
-                text_attn = getattr(text_cfg, "_attn_implementation", None)
-                if text_attn:
-                    actual_attn = f"{actual_attn} / text:{text_attn}"
+                actual_attn = getattr(text_cfg, "_attn_implementation", "unknown")
+                top_attn = getattr(self.model.config, "_attn_implementation", None)
+                actual_attn = f"top:{top_attn} / text:{actual_attn}"
+            else:
+                actual_attn = getattr(self.model.config, "_attn_implementation", "unknown")
         except Exception:
             pass
 
@@ -501,8 +525,18 @@ class TorchEngine(BaseEngine):
                 next_token_logits = chunk_out.logits[:, -1, :].clone()
 
             del chunk_out
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            # Do NOT call torch.cuda.empty_cache() between chunks.
+            # On multi-GPU with async H2D transfers (non_blocking=True in
+            # StreamingDynamicCache.update), calling empty_cache() while the
+            # CUDA allocator is still managing in-flight DMA buffers causes
+            # intermittent cudaErrorLaunchFailure at long contexts (32k+).
+            # PyTorch's allocator recycles memory automatically; a single
+            # empty_cache() after the full prefill loop is sufficient.
+
+        # Single cache flush after entire prefill — safe here since all chunk
+        # tensors are freed and no async transfers are in flight.
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         if next_token_logits is None:
             raise RuntimeError("Prefill produced no logits — empty input?")
