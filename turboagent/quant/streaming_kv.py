@@ -1,5 +1,5 @@
 """
-Option C — Streaming KV Decompression (zero intra-turn compression).
+Streaming KV Decompression (zero intra-turn compression).
 
 Design philosophy
 -----------------

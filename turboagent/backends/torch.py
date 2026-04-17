@@ -58,7 +58,7 @@ class TorchEngine(BaseEngine):
         kv_storage: KV storage strategy.
             ``"gpu"``            — classic path: decompress all layers to GPU
                                    upfront, inject as DynamicCache (v1.0).
-            ``"cpu_streaming"``  — Option C Stage 1: keep compressed KV on CPU,
+            ``"cpu_streaming"``  — keep compressed KV on CPU,
                                    stream one layer at a time to GPU during the
                                    forward pass (StreamingDynamicCache).
             ``"auto"``           — choose ``"cpu_streaming"`` when estimated KV
@@ -335,7 +335,7 @@ class TorchEngine(BaseEngine):
         )
 
     # ------------------------------------------------------------------
-    # Option C: Streaming KV injection
+    # Streaming KV injection
     # ------------------------------------------------------------------
 
     def _resolve_kv_storage(self, kv_cache: TurboQuantKVCache) -> str:
@@ -433,7 +433,7 @@ class TorchEngine(BaseEngine):
         storage_mode = self._resolve_kv_storage(kv_cache)
         past_key_values = None
         if storage_mode == "cpu_streaming":
-            # Option C — Stage 2: use StreamingDynamicCache even on the first
+            # Use StreamingDynamicCache even on the first
             # turn (n_prev == 0).  This prevents GPU KV accumulation during
             # long prefills: each layer's KV is compressed to CPU immediately
             # rather than building up 28 × seq × kv_heads × head_dim FP16 on GPU.
@@ -443,11 +443,11 @@ class TorchEngine(BaseEngine):
             past_key_values = self._build_streaming_cache(kv_cache)
             if n_prev > 0:
                 logger.info(
-                    f"Option C active: streaming {n_prev} past tokens from CPU "
+                    f"Streaming KV active: streaming {n_prev} past tokens from CPU "
                     f"({kv_cache.memory_usage_gb()*1000:.1f} MB compressed)"
                 )
             else:
-                logger.info("Option C active: layer-wise prefill (first turn, no past)")
+                logger.info("Streaming KV active: layer-wise prefill (first turn, no past)")
         elif n_prev > 0:
             past_key_values = self._inject_kv_from_cache(kv_cache, n_prev)
 

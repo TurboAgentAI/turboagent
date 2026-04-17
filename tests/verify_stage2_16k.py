@@ -1,5 +1,5 @@
 """
-Option C Stage 2 — NIAH on Qwen2.5-7B with device_map="auto".
+Streaming KV — NIAH on Qwen2.5-7B with device_map="auto".
 
 Verifies that cpu_streaming:
   1. Runs a large-context prompt on a 12 GB GPU using streaming KV (no full
@@ -122,7 +122,7 @@ def run_test(engine, kv_cache, prompt: str, label: str) -> dict:
 
 def main():
     print("=" * 65)
-    print(f"Option C Stage 2 — {TARGET_TOKENS//1000}k NIAH on Qwen2.5-7B")
+    print(f"Streaming KV — {TARGET_TOKENS//1000}k NIAH on Qwen2.5-7B")
     print(f"  Model:  {MODEL_PATH}")
     print(f"  Target: {TARGET_TOKENS:,} tokens | Needle: '{NEEDLE}'")
     gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
@@ -166,7 +166,7 @@ def main():
         max_context=TARGET_TOKENS * 2,
     )
 
-    result = run_test(engine, cache_stream, prompt, "cpu_streaming (Option C Stage 2)")
+    result = run_test(engine, cache_stream, prompt, "cpu_streaming")
 
     # ── Summary ────────────────────────────────────────────────────────────
     expected_fp16_mb = (

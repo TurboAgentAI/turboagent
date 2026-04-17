@@ -1,5 +1,5 @@
 """
-Tests for StreamingDynamicCache (Option C — zero intra-turn compression).
+Tests for StreamingDynamicCache (Streaming KV — zero intra-turn compression).
 
 Design under test
 -----------------

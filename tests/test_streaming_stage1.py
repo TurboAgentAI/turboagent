@@ -1,5 +1,5 @@
 """
-Option C Stage 1 — Integration correctness test.
+Streaming KV — Integration correctness test.
 
 Loads Qwen3-0.6B locally and verifies that the cpu_streaming path produces
 the same KV state (to within TurboQuant quantization noise) as the classic
@@ -84,7 +84,7 @@ def compare_kv_caches(cache_gpu, cache_stream, n_layers: int):
 
 def main():
     print("=" * 60)
-    print("Option C Stage 1 — Streaming KV Correctness Test")
+    print("Streaming KV — Correctness Test")
     print(f"Model: {MODEL_PATH}")
     print(f"Target context: {SEQ_LEN} tokens")
     print("=" * 60)
@@ -156,7 +156,7 @@ def main():
         max_context=SEQ_LEN * 2,
     )
     resp_stream, metrics_stream = run_single_forward(
-        engine_stream, prompt, cache_stream, "CPU streaming (Option C)"
+        engine_stream, prompt, cache_stream, "CPU streaming"
     )
 
     # ── Results ───────────────────────────────────────────────────────────────

@@ -1,10 +1,10 @@
-# TurboAgent v1.1.0 — Option C Streaming KV
+# TurboAgent v1.1.0 — Streaming KV
 
 Release date: 2026-04-15
 
 ## Highlights
 
-**Option C (`cpu_streaming` mode) is fully validated.** Run large models at long contexts on consumer and multi-GPU hardware by keeping KV cache on CPU (pinned memory) and streaming layers to GPU on demand. Only one layer's KV lives on GPU at a time during attention.
+**Streaming KV (`cpu_streaming` mode) is fully validated.** Run large models at long contexts on consumer and multi-GPU hardware by keeping KV cache on CPU (pinned memory) and streaming layers to GPU on demand. Only one layer's KV lives on GPU at a time during attention.
 
 - **50/50 NIAH (Needle-in-a-Haystack) depths PASS** across three model families and four context lengths
 - **5.22x–5.80x KV compression** via TurboQuant, applied lossless per-turn
