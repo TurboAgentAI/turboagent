@@ -50,7 +50,7 @@ credentials.json
 # GitHub Actions / CI — not for public repo
 .github/
 
-# Internal testing infrastructure (Vast.ai scripts — not for public repo)
+# Internal testing infrastructure (local only)
 vastai/
 
 # Website

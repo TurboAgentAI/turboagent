@@ -87,7 +87,8 @@ class HardwareDetector:
             "kv_mode": "turbo3",
             "n_gpu_layers": 0,
             "context": 8192,
-            "offload_strategy": "cpu_only"
+            "offload_strategy": "cpu_only",
+            "quantize_weights": None,
         }
 
         # --- HEURISTICS FOR 70B CLASS MODELS ---
@@ -104,28 +105,33 @@ class HardwareDetector:
                     })
                 elif vram >= 40.0:
                     # A6000 / dual-GPU configs (40-80GB Class)
-                    # Full model on GPU with generous context
+                    # NF4: 70B → ~35 GB, fits on GPU with room for KV
                     config.update({
                         "n_gpu_layers": -1,
                         "context": 131072,
-                        "kv_mode": "turbo4",  # Plenty of VRAM, prioritize quality
+                        "kv_mode": "turbo4",
+                        "quantize_weights": "nf4",
                         "offload_strategy": "gpu_only"
                     })
                 elif vram >= 23.0:
                     # RTX 3090 / 4090 / 5090 (24GB+ Class)
-                    # Can fit ~40-45 layers of Q4_K_M 70B + ~128k compressed KV cache
+                    # NF4: 70B → ~35 GB, needs hybrid offload but far more
+                    # layers fit on GPU than FP16. Stream KV from CPU.
                     config.update({
-                        "n_gpu_layers": 40,
+                        "n_gpu_layers": -1,
                         "context": 131072,
-                        "kv_mode": "turbo3", # 4.9x compression gives best context length here
+                        "kv_mode": "turbo3",
+                        "quantize_weights": "nf4",
                         "offload_strategy": "hybrid"
                     })
                 elif vram >= 15.0:
                     # RTX 4080 (16GB Class)
+                    # NF4 critical — without it, only ~25 layers fit
                     config.update({
-                        "n_gpu_layers": 25,
+                        "n_gpu_layers": -1,
                         "context": 65536,
-                        "kv_mode": "turbo4", # Slightly less compression, better quality for tighter fits
+                        "kv_mode": "turbo3",
+                        "quantize_weights": "nf4",
                         "offload_strategy": "hybrid"
                     })
                 else:
@@ -134,6 +140,7 @@ class HardwareDetector:
                         "n_gpu_layers": 15,
                         "context": 32768,
                         "kv_mode": "turbo3",
+                        "quantize_weights": "nf4",
                         "offload_strategy": "heavy_cpu"
                     })
             

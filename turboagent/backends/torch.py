@@ -63,6 +63,10 @@ class TorchEngine(BaseEngine):
                                    forward pass (StreamingDynamicCache).
             ``"auto"``           — choose ``"cpu_streaming"`` when estimated KV
                                    size exceeds available VRAM, else ``"gpu"``.
+        quantize_weights: 4-bit weight quantization via bitsandbytes.
+            ``None``  — load weights in native precision (default).
+            ``"nf4"`` — NormalFloat 4-bit (recommended, used by QLoRA).
+            ``"int4"``— symmetric uniform 4-bit.
         **kwargs: Hardware config from HardwareDetector.
     """
 
@@ -70,10 +74,12 @@ class TorchEngine(BaseEngine):
         self,
         model_id: str,
         kv_storage: Literal["auto", "gpu", "cpu_streaming"] = "auto",
+        quantize_weights: Optional[Literal["nf4", "int4"]] = None,
         **kwargs,
     ):
         self.model_id = model_id
         self.kv_storage = kv_storage
+        self.quantize_weights = quantize_weights
         self.n_ctx = kwargs.get("context", 131072)
         self.max_new_tokens = kwargs.get("max_tokens", 4096)
         self.temperature = kwargs.get("temperature", 0.7)
@@ -124,26 +130,29 @@ class TorchEngine(BaseEngine):
         max_memory = None
         if device_map == "auto" and torch.cuda.is_available():
             n_gpus = torch.cuda.device_count()
+            # 4-bit weights use ~4x less VRAM, so we can allocate more to GPU.
+            weight_ratio = 0.25 if quantize_weights is not None else 1.0
             if n_gpus == 1:
                 total_gib = torch.cuda.get_device_properties(0).total_memory / (1024**3)
                 if kv_storage == "cpu_streaming":
-                    # Streaming: KV never accumulates on GPU; only tiny compute
-                    # buffers needed. Reserve 0.5 GiB for activations/fragmentation.
                     reserve_gib = 0.5
                 else:
-                    # GPU path: need headroom for KV cache + activations.
                     reserve_gib = 2.0
                 cap_gib = max(int(total_gib - reserve_gib), int(total_gib * 0.75))
                 max_memory = {0: f"{cap_gib}GiB", "cpu": "80GiB"}
                 logger.info(
                     f"Single-GPU max_memory: {cap_gib} GiB "
-                    f"(kv_storage={kv_storage!r}, reserve={reserve_gib} GiB)"
+                    f"(kv_storage={kv_storage!r}, reserve={reserve_gib} GiB"
+                    f"{', 4-bit weights' if quantize_weights else ''})"
                 )
             elif n_gpus > 1:
                 max_memory = {}
+                # With 4-bit weights, model is ~4x smaller so we can use more
+                # of each GPU for activations/KV — raise from 55% to 80%.
+                gpu_frac = 0.80 if quantize_weights is not None else 0.55
                 for i in range(n_gpus):
                     total_gib = torch.cuda.get_device_properties(i).total_memory / (1024**3)
-                    cap_gib = int(total_gib * 0.55)  # leave 45% for activations
+                    cap_gib = int(total_gib * gpu_frac)
                     max_memory[i] = f"{cap_gib}GiB"
                 max_memory["cpu"] = "200GiB"
                 logger.info(f"Multi-GPU balanced sharding via max_memory: {max_memory}")
@@ -176,12 +185,44 @@ class TorchEngine(BaseEngine):
                 f"(will rely on kwarg only): {e}"
             )
 
+        # 4-bit weight quantization via bitsandbytes (NF4 or INT4).
+        # Reduces model weight memory ~4x (e.g. 70B: 140 GB → ~35 GB).
+        # Independent of TurboQuant KV compression — both stack.
+        bnb_config = None
+        if quantize_weights is not None:
+            try:
+                from transformers import BitsAndBytesConfig
+            except ImportError:
+                raise ImportError(
+                    "BitsAndBytesConfig requires transformers >= 4.30.0. "
+                    "Install via: pip install transformers>=4.40.0"
+                )
+            try:
+                import bitsandbytes  # noqa: F401
+            except ImportError:
+                raise ImportError(
+                    "4-bit weight quantization requires bitsandbytes. "
+                    "Install via: pip install bitsandbytes>=0.41.0"
+                )
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type=quantize_weights,
+                bnb_4bit_compute_dtype=self.dtype,
+                bnb_4bit_use_double_quant=True,
+            )
+            logger.info(
+                f"4-bit weight quantization enabled: {quantize_weights.upper()}, "
+                f"compute_dtype={self.dtype}, double_quant=True"
+            )
+
         load_kwargs = dict(
             dtype=self.dtype,
             device_map=device_map,
             trust_remote_code=True,
             attn_implementation=attn_impl,
         )
+        if bnb_config is not None:
+            load_kwargs["quantization_config"] = bnb_config
         if pre_config is not None:
             load_kwargs["config"] = pre_config
         if max_memory is not None:

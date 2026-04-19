@@ -82,6 +82,6 @@ Multi-GPU validation performed on Vast.ai (2× RTX PRO 6000 Blackwell, 192 GiB).
 
 ## What's next (v1.2)
 
-- Merge with Compton/BitTorch (4-bit weight quantization + desktop GUI)
+- BitTorch integration (4-bit weight quantization)
 - FlexTensor integration (automatic weight GPU↔CPU offloading)
 - Target: 70B on RTX 4090 with 200k+ context

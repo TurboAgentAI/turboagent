@@ -28,7 +28,8 @@ class TestCLIInfo:
             timeout=10,
         )
         assert result.returncode == 0
-        assert "0.1.0" in result.stdout
+        from turboagent.version import __version__
+        assert __version__ in result.stdout
 
     def test_no_args_prints_help(self):
         result = subprocess.run(
