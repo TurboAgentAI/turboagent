@@ -139,7 +139,10 @@ class TorchEngine(BaseEngine):
                 else:
                     reserve_gib = 2.0
                 cap_gib = max(int(total_gib - reserve_gib), int(total_gib * 0.75))
-                max_memory = {0: f"{cap_gib}GiB", "cpu": "80GiB"}
+                if quantize_weights is not None:
+                    max_memory = {0: f"{cap_gib}GiB"}
+                else:
+                    max_memory = {0: f"{cap_gib}GiB", "cpu": "80GiB"}
                 logger.info(
                     f"Single-GPU max_memory: {cap_gib} GiB "
                     f"(kv_storage={kv_storage!r}, reserve={reserve_gib} GiB"
